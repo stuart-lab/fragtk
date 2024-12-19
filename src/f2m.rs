@@ -234,7 +234,7 @@ fn fcount(
     // write cells
     let cell_path = output.join("barcodes.tsv.gz");
     info!("Writing output cells file: {:?}", &cell_path);
-    write_cells(&cell_path, cell_file)
+    write_cells(&cell_path, cell_file, num_threads)
         .expect("Failed to write cells");
 
     Ok(())
@@ -243,6 +243,7 @@ fn fcount(
 fn write_cells(
     outfile: &Path,
     cells: &Path,
+    num_threads: usize,
 ) -> io::Result<()> {
     let input = File::open(cells)?;
     let reader = BufReader::new(input);
