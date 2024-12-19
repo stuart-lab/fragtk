@@ -232,7 +232,7 @@ fn fcount(
         .expect("Failed to write matrix"); // features stored as rows
 
     // write cells
-    let cell_path = output.join("barcodes.tsv");
+    let cell_path = output.join("barcodes.tsv.gz");
     info!("Writing output cells file: {:?}", &cell_path);
     write_cells(&cell_path, cell_file)
         .expect("Failed to write cells");
@@ -244,11 +244,23 @@ fn write_cells(
     outfile: &Path,
     cells: &Path,
 ) -> io::Result<()> {
-    // Copy cell barcodes to output directory
-    match fs::copy(&cells, &outfile) {
-        Ok(bytes_copied) => info!("Successfully copied {} bytes.", bytes_copied),
-        Err(e) => eprintln!("Failed to copy file: {}", e),
+    let input = File::open(cells)?;
+    let reader = BufReader::new(input);
+
+    let output = File::create(outfile)?;
+    let mut writer: ParCompress<Gzip> = ParCompressBuilder::new()
+        .compression_level(Compression::default())
+        .num_threads(num_threads)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .from_writer(output);
+
+    for line in reader.lines() {
+        writeln!(writer, "{}", line?)?;
     }
+
+    writer.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    
+    info!("Successfully wrote compressed cell barcodes to {:?}", outfile);
     Ok(())
 }
 
