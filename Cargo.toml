@@ -2,6 +2,10 @@
 name = "fragtk"
 version = "1.1.0"
 edition = "2021"
+authors = ["Tim Stuart" <stuartt@gis.a-star.edu.sg>]
+description = "Fragment file toolkit"
+license = "MIT"
+repository = "https://github.com/stuart-lab/fragtk"
 
 [dependencies]
 clap = { version = "4.1", features = ["derive"] }
