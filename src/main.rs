@@ -17,7 +17,7 @@ mod filter;
 fn main() -> Result<(), Box<dyn Error>> {
 
     let matches = Command::new("fragtk")
-        .version("1.0")
+        .version("1.1.0")
         .author("Tim Stuart")
         .about("Fragment file processing tools")
         .arg_required_else_help(true)
@@ -101,9 +101,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .help("Minimum number of fragments for a cell to be included")
                     .long_help(
                         "Sets the minimum number of fragments a cell must have to be included in the output. \
-                        Cells with fewer fragments than this threshold will be filtered out."
+                        Cells with fewer fragments than this threshold will be filtered out. Cannot be used with --ncells"
                     )
-                    .default_value("200"),
+                    .conflicts_with("ncells")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("ncells")
+                    .short('n')
+                    .long("ncells")
+                    .value_name("NUMBER")
+                    .help("Number of top cells to select")
+                    .long_help(
+                        "Select this many cells with the highest fragment counts. \
+                        Cannot be used together with --threshold."
+                    )
+                    .conflicts_with("threshold")
+                    .required(false),
             )
         )
         .subcommand(

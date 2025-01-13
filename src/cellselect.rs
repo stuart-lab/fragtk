@@ -21,18 +21,41 @@ pub fn cellselect(matches: &clap::ArgMatches) -> Result<(), Box<dyn Error>> {
     let output_file = matches.get_one::<String>("outfile").unwrap();
     info!("Output file: {:?}", output_file);
 
-    let threshold: usize = matches
-        .get_one::<String>("threshold")
-        .expect("defaulted")
-        .parse()
-        .unwrap_or_else(|_| {
-            eprintln!("Failed to parse threshold as usize");
+    // Get either threshold or ncells from matches
+    let (threshold, ncells) = match (matches.get_one::<String>("threshold"), 
+                                   matches.get_one::<String>("ncells")) {
+        (Some(t), None) => {
+            let threshold = t.parse().unwrap_or_else(|_| {
+                eprintln!("Failed to parse threshold as usize");
+                std::process::exit(1);
+            });
+            info!("Cell count cutoff: {:?}", threshold);
+            (Some(threshold), None)
+        },
+        (None, Some(n)) => {
+            let ncells = n.parse().unwrap_or_else(|_| {
+                eprintln!("Failed to parse ncells as usize");
+                std::process::exit(1);
+            });
+            info!("Cell number cutoff: {:?}", ncells);
+            (None, Some(ncells))
+        },
+        (None, None) => {
+            eprintln!("Either --threshold or --ncells must be specified");
             std::process::exit(1);
-        });
-    info!("Cell count cutoff: {:?}", threshold);
+        },
+        (Some(_), Some(_)) => {
+            eprintln!("Cannot specify both --threshold and --ncells");
+            std::process::exit(1);
+        }
+    };
 
     let bc_count = count_barcodes(&frag_file)?;
-    let selected = select_barcodes(&bc_count, &threshold)?;
+    let selected = if threshold.is_some() {
+        select_barcodes(&bc_count, &threshold.unwrap())?
+    } else {
+        top_barcodes(&bc_count, &ncells.unwrap())?
+    };
 
     // Output results to the specified file
     let mut writer = File::create(output_file)?;
@@ -65,6 +88,39 @@ fn select_barcodes(
     }
 
     Ok(filtered_cells)
+}
+
+fn top_barcodes(
+    barcodes: &FxHashMap<String, usize>,
+    ncells: &usize,
+) -> io::Result<Vec<String>> {
+    // create vectors of cells and counts
+    let mut cells: Vec<String> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+
+    // iterate over barcode hashmap, filling in the vectors
+    for (cell_barcode, &count) in barcodes.iter() {
+        cells.push(cell_barcode.clone());
+        counts.push(count);
+    }
+
+    // create index vector and sort it based on counts
+    let mut idx: Vec<usize> = (0..cells.len()).collect();
+    idx.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]));
+
+    if cells.len() < *ncells {
+        eprintln!("Warning: Only {} cells available, fewer than requested {}", cells.len(), ncells);
+    }
+
+    // Take the top n cells using the sorted indices
+    let n = std::cmp::min(*ncells, cells.len());
+    let selected: Vec<String> = idx
+        .into_iter()
+        .take(n)
+        .map(|i| cells[i].clone())
+        .collect();
+
+    Ok(selected)
 }
 
 fn count_barcodes(frag_file: &Path,) -> io::Result<FxHashMap<String, usize>> {
