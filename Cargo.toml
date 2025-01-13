@@ -6,6 +6,7 @@ authors = ["Tim Stuart <stuartt@gis.a-star.edu.sg>"]
 description = "Fragment file toolkit"
 license = "MIT"
 repository = "https://github.com/stuart-lab/fragtk"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.1", features = ["derive"] }
