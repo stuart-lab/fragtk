@@ -34,7 +34,13 @@ fragtk filter -f <fragments.tsv.gz> -c <barcodes.txt> | bgzip -c > filtered.tsv.
 
 ## Installation
 
-Clone the git repo:
+### Using cargo
+
+```
+cargo install fragtk
+```
+
+### From GitHub
 
 ```
 git clone git@github.com:stuart-lab/fragtk.git
