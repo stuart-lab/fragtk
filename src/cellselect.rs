@@ -11,34 +11,27 @@ use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashMap;
 use log::info;
 
-pub fn cellselect(matches: &clap::ArgMatches) -> Result<(), Box<dyn Error>> {
+pub fn cellselect(
+    fragments: &str,
+    outfile: &str,
+    threshold: &Option<usize>,
+    ncells: &Option<usize>
+) -> Result<(), Box<dyn Error>> {
 
-    let frag_file = Path::new(matches.get_one::<String>("fragments").unwrap())
+    let frag_file = Path::new(fragments)
         .canonicalize()
         .expect("Can't find path to input fragment file");
     info!("Received fragment file: {:?}", frag_file);
 
-    let output_file = matches.get_one::<String>("outfile").unwrap();
-    info!("Output file: {:?}", output_file);
+    info!("Output file: {:?}", outfile);
 
-    // Get either threshold or ncells from matches
-    let (threshold, ncells) = match (matches.get_one::<String>("threshold"), 
-                                   matches.get_one::<String>("ncells")) {
+    // Get either threshold or ncells
+    match (threshold, ncells) {
         (Some(t), None) => {
-            let threshold = t.parse().unwrap_or_else(|_| {
-                eprintln!("Failed to parse threshold as usize");
-                std::process::exit(1);
-            });
-            info!("Cell count cutoff: {:?}", threshold);
-            (Some(threshold), None)
+            info!("Cell count cutoff: {:?}", t);
         },
         (None, Some(n)) => {
-            let ncells = n.parse().unwrap_or_else(|_| {
-                eprintln!("Failed to parse ncells as usize");
-                std::process::exit(1);
-            });
-            info!("Cell number cutoff: {:?}", ncells);
-            (None, Some(ncells))
+            info!("Cell number cutoff: {:?}", n);
         },
         (None, None) => {
             eprintln!("Either --threshold or --ncells must be specified");
@@ -58,7 +51,7 @@ pub fn cellselect(matches: &clap::ArgMatches) -> Result<(), Box<dyn Error>> {
     };
 
     // Output results to the specified file
-    let mut writer = File::create(output_file)?;
+    let mut writer = File::create(outfile)?;
     let mut output = String::new();
 
     for (barcode, count) in &bc_count {

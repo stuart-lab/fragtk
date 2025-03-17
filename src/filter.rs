@@ -4,16 +4,15 @@ use std::path::Path;
 use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashSet;
 
-pub fn run(matches: &clap::ArgMatches) -> std::io::Result<()> {
-    // Get file paths from command-line arguments
-    let cells_file = matches.get_one::<String>("cells").unwrap();
-    let fragments_file = matches.get_one::<String>("fragments").unwrap();
-
+pub fn run(
+    fragments: &str,
+    cells: &str
+) -> std::io::Result<()> {
     // Load the cell barcodes into a FxHashSet for fast lookups
-    let cell_barcodes = load_cells(cells_file)?;
+    let cell_barcodes = load_cells(cells)?;
 
     // Filter the fragment file based on the cell barcodes
-    filter_fragments(fragments_file, &cell_barcodes)?;
+    filter_fragments(fragments, &cell_barcodes)?;
 
     Ok(())
 }
@@ -21,7 +20,7 @@ pub fn run(matches: &clap::ArgMatches) -> std::io::Result<()> {
 fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<String>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut cell_barcodes = FxHashSet::default(); // Change this line
+    let mut cell_barcodes = FxHashSet::default();
 
     for line in reader.lines() {
         let line = line?;

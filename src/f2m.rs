@@ -21,32 +21,34 @@ use gzp::{
     par::compress::{ParCompress, ParCompressBuilder},
 };
 
-pub fn f2m(matches: &clap::ArgMatches) -> Result<(), Box<dyn Error>> {
+pub fn f2m(
+    fragments: &str,
+    bed: &str,
+    cells: &str,
+    outdir: &str,
+    num_threads: usize,
+    group: bool
+) -> Result<(), Box<dyn Error>> {
 
-    let frag_file = Path::new(matches.get_one::<String>("fragments").unwrap())
+    let frag_file = Path::new(fragments)
         .canonicalize()
         .expect("Can't find path to input fragment file");
     info!("Received fragment file: {:?}", frag_file);
 
-    let bed_file = Path::new(matches.get_one::<String>("bed").unwrap())
+    let bed_file = Path::new(bed)
         .canonicalize()
         .expect("Can't find path to input BED file");
     info!("Received BED file: {:?}", bed_file);
 
-    let cell_file = Path::new(matches.get_one::<String>("cells").unwrap())
+    let cell_file = Path::new(cells)
         .canonicalize()
         .expect("Can't find path to input cell file");
     info!("Received cell file: {:?}", cell_file);
 
-    let output_directory = matches.get_one::<String>("outdir").unwrap();
-    info!("Received output directory: {:?}", output_directory);
-
-    let group = matches.get_flag("group");
+    info!("Received output directory: {:?}", outdir);
     info!("Grouping peaks: {:?}", group);
 
-    let output_path = Path::new(output_directory);
-
-    let num_threads = *matches.get_one::<usize>("threads").unwrap();
+    let output_path = Path::new(outdir);
 
     // Create the directory if it does not exist
     if !output_path.exists() {
@@ -289,7 +291,7 @@ fn write_matrix_market(
 
     // Write the header for the Matrix Market format
     output.push_str("%%MatrixMarket matrix coordinate integer general\n");
-    output.push_str("%%metadata json: {{\"software_version\": \"fragtk-1.1.0\"}}\n");
+    output.push_str(&format!("%%metadata json: {{\"software_version\": \"fragtk-{}\"}}\n", env!("CARGO_PKG_VERSION")));
     output.push_str(&format!("{} {} {}\n", nrow, ncol, nonzero));
     encoder.write_all(output.as_bytes())?;
     output.clear();
@@ -333,7 +335,11 @@ fn peak_intervals(
     
     // bed file reader
     let file = File::open(bed_file)?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead> = if bed_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        Box::new(BufReader::new(MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
     
     // hashmap of peak intervals for each chromosome
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
@@ -364,15 +370,15 @@ fn peak_intervals(
                     let start: u32 = match fields[1].parse() {
                         Ok(num) => num,
                         Err(_) => {
-                            error!("Line {}: Failed to parse start position", index + 1);
-                            continue;
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                                format!("Line {}: Failed to parse start position", index + 1)));
                         }
                     };
                     let end: u32 = match fields[2].parse() {
                         Ok(num) => num,
                         Err(_) => {
-                            error!("Line {}: Failed to parse end position", index + 1);
-                            continue;
+                            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                format!("Line {}: Failed to parse end position", index +1)));
                         }
                     };
 
@@ -382,8 +388,8 @@ fn peak_intervals(
                         let peakgroup: String = match fields[3].parse() {
                             Ok(num) => num,
                             Err(_) => {
-                                error!("Line {}: Failed to parse group information", index + 1);
-                                continue;
+                                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                    format!("Line {}: Failed to parse group information", index + 1)));
                             }
                         };
 
@@ -401,12 +407,13 @@ fn peak_intervals(
                     }
                     total_peaks += 1;
                 } else {
-                    error!("Line {}: Less than three fields", index + 1);
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("Line {}: Less than three fields", index + 1)));
                 }
             },
             Err(e) => {
-                error!("Error reading line {}: {}", index + 1, e);
-                break;
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Error reading line {}: {}", index + 1, e)));
             }
         }
     }
