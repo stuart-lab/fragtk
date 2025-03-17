@@ -1,11 +1,12 @@
 [package]
 name = "fragtk"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["Tim Stuart <stuartt@gis.a-star.edu.sg>"]
 description = "Fragment file toolkit"
 license = "MIT"
 repository = "https://github.com/stuart-lab/fragtk"
+documentation = "https://crates.io/crates/fragtk"
 readme = "README.md"
 
 [dependencies]
