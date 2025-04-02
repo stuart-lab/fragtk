@@ -27,7 +27,8 @@ pub fn f2m(
     cells: &str,
     outdir: &str,
     num_threads: usize,
-    group: bool
+    group: bool,
+    pic: bool
 ) -> Result<(), Box<dyn Error>> {
 
     let frag_file = Path::new(fragments)
@@ -74,7 +75,7 @@ pub fn f2m(
         }
     }
 
-    fcount(&frag_file, &bed_file, &cell_file, output_path, group, num_threads)?;
+    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads)?;
     
     Ok(())
 }
@@ -85,6 +86,7 @@ fn fcount(
     cell_file: &Path,
     output: &Path,
     group: bool,
+    pic: bool,
     num_threads: usize,
 ) -> io::Result<()> {
     info!(
@@ -198,6 +200,13 @@ fn fcount(
                 }
             };
 
+            // From Paired Insertion Counting paper
+            // https://www.nature.com/articles/s41592-023-02103-7
+            //
+            // In PIC, for a given chromosome interval, if the pair of insertions of an ATAC-seq fragment
+            // are both within the interval, they are counted as one (pair); if only one insertion is within
+            // the interval and the other is outside the interval, also count one (pair).
+
             if let Some(lapper) = &mut current_lapper {
                 // seems to be a problem with seek if lapper has one element
                 // set cursor to 0
@@ -209,10 +218,14 @@ fn fcount(
                     let peak_end = interval.stop;
                     *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
 
-                    // Check if fragment end is behind peak end (if so, it overlaps and we don't need a full search)
                     if endpos < peak_end {
+                        // Check if fragment end is behind peak end (if so, it overlaps and we don't need a full search)
                         check_end = false;
-                        *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                        
+                        // if PIC, count one only for pair
+                        if !pic {
+                            *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                        }
                     }
                 }
                 if check_end {

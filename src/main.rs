@@ -49,6 +49,10 @@ enum Commands {
         #[arg(short, long, default_value = "4", value_parser = clap::value_parser!(usize))]
         threads: usize,
 
+        /// Use paired insertion counting
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        pic: bool,
+
         /// Group peaks by variable in fourth BED column
         #[arg(long, action = clap::ArgAction::SetTrue)]
         group: bool,
@@ -91,8 +95,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Matrix { fragments, bed, cells, outdir, threads, group } => {
-            f2m::f2m(fragments, bed, cells, outdir, *threads, *group)?
+        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group } => {
+            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic)?
         },
         Commands::Count { fragments, outfile, threshold, ncells } => {
             cellselect::cellselect(fragments, outfile, threshold, ncells)?
