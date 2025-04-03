@@ -1,0 +1,17 @@
+# 1.3.0
+
+- Add `--pic` option for paired insertion counting to `fragtk matrix`
+
+# 1.2.0
+
+- Update command line interface
+- Allow input BED file for `fragtk matrix` to be gzipped
+- Add `--ncell` option to `fragtk count`
+
+# 1.1.0
+
+Performance improvements
+
+# 1.0.0
+
+First release
