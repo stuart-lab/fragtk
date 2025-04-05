@@ -111,8 +111,12 @@ fn fcount(
     };
 
     // create hashmap for cell barcodes
-    let cellreader = File::open(cell_file)
-        .map(BufReader::new)?;
+    let cell_file_handle = File::open(cell_file)?;
+    let cellreader: Box<dyn BufRead> = if cell_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        Box::new(BufReader::new(MultiGzDecoder::new(cell_file_handle)))
+    } else {
+        Box::new(BufReader::new(cell_file_handle))
+    };
     
     let mut cells: FxHashMap<String, u32> = FxHashMap::default();
     for (index, line) in cellreader.lines().enumerate() {
@@ -260,6 +264,15 @@ fn write_cells(
     cells: &Path,
     num_threads: usize,
 ) -> io::Result<()> {
+
+    // If input is gzipped, just copy the file
+    if cells.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        fs::copy(cells, outfile)?;
+        info!("Copied gzipped cell barcodes to {:?}", outfile);
+        return Ok(());
+    }
+
+    // Otherwise proceed with reading, compressing, and writing
     let input = File::open(cells)?;
     let reader = BufReader::new(input);
 

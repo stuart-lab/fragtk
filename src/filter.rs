@@ -18,8 +18,16 @@ pub fn run(
 }
 
 fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<String>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let file = File::open(&path)?;
+    let reader = if path.as_ref().to_str()
+        .map(|s| s.ends_with(".gz"))
+        .unwrap_or(false) 
+    {
+        Box::new(BufReader::new(MultiGzDecoder::new(file))) as Box<dyn BufRead>
+    } else {
+        Box::new(BufReader::new(file)) as Box<dyn BufRead>
+    };
+    
     let mut cell_barcodes = FxHashSet::default();
 
     for line in reader.lines() {
