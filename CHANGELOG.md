@@ -1,3 +1,9 @@
+# 1.4.0
+
+- Enable `--cells` file to be gzipped
+- Update documentation
+- Add option to build man files
+
 # 1.3.0
 
 - Add `--pic` option for paired insertion counting to `fragtk matrix`
