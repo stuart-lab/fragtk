@@ -7,19 +7,21 @@ use std::{
     io::BufReader,
     io::BufRead,
     io::Write,
+    sync::mpsc,
+    thread,
 };
 use rust_lapper::{Interval, Lapper};
 use flate2::read::MultiGzDecoder;
 use flate2::Compression;
 use log::error;
 use log::info;
-use log::warn;
 use rustc_hash::FxHashMap;
 use gzp::{
     deflate::Gzip,
     ZWriter,
     par::compress::{ParCompress, ParCompressBuilder},
 };
+use smallvec::SmallVec;
 
 pub fn f2m(
     fragments: &str,
@@ -102,14 +104,14 @@ fn fcount(
     // write features
     let feature_path = output.join("features.tsv.gz");
     info!("Writing output feature file: {:?}", &feature_path);
-    let (total_peaks, mut peaks) = match peak_intervals(bed_file, group, &feature_path, num_threads) {
+    let (total_peaks, peaks) = match peak_intervals(bed_file, group, &feature_path, num_threads) {
         Ok(trees) => trees,
         Err(e) => {
             error!("Failed to read BED file: {}", e);
             return Err(e);
         }
     };
-
+    
     // create hashmap for cell barcodes
     let cell_file_handle = File::open(cell_file)?;
     let cellreader: Box<dyn BufRead> = if cell_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
@@ -124,125 +126,172 @@ fn fcount(
         let index_u32 = index as u32;
         cells.insert(line, index_u32);
     }
+    
+    // Estimate the peak-cell count map size for preallocation
+    let cell_count = cells.len();
+    info!("Loaded {} cell barcodes", cell_count);
+    
+    // Estimate an average of cells per peak for preallocation 
+    let avg_cells_per_peak = cell_count.min(1000);
 
     // vector of features
     // each element is hashmap of cell: count
-    let mut peak_cell_counts: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::<u32, u32>::default(); total_peaks];
+    let mut peak_cell_counts: Vec<FxHashMap<u32, u32>> = Vec::with_capacity(total_peaks);
+    for _ in 0..total_peaks {
+        peak_cell_counts.push(FxHashMap::with_capacity_and_hasher(
+            avg_cells_per_peak, 
+            Default::default()
+        ));
+    }
 
-    // frag file reading
-    let frag_file = File::open(frag_file)?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(frag_file));
-
-    let mut line_count: u64 = 0;
-    let update_interval = 1_000_000;
-    let mut line_str = String::new();
-    let mut startpos: u32;
-    let mut endpos: u32;
-
+    // Create a channel for communication between threads
+    let (tx, rx) = mpsc::sync_channel(100);
+    
+    // Spawn thread for decompression and reading
+    let frag_file = frag_file.to_path_buf();
+    let reader_handle = thread::spawn(move || {
+        let file = match File::open(&frag_file) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open fragment file: {}", e);
+                return;
+            }
+        };
+        
+        let reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(file));
+        
+        // Process fragments in chunks for better performance
+        const CHUNK_SIZE: usize = 10_000;
+        let mut fragments = Vec::with_capacity(CHUNK_SIZE);
+        let mut total_fragments = 0;
+        
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    // Skip header lines
+                    if !line.starts_with('#') {
+                        fragments.push(line);
+                        
+                        if fragments.len() >= CHUNK_SIZE {
+                            total_fragments += fragments.len();
+                            
+                            // Report progress
+                            if total_fragments % 1_000_000 == 0 {
+                                print!("\rProcessed {} M fragments", total_fragments / 1_000_000);
+                                std::io::stdout().flush().expect("Can't flush output");
+                            }
+                            
+                            // Send chunks for processing
+                            let chunk_to_send = std::mem::replace(&mut fragments, Vec::with_capacity(CHUNK_SIZE));
+                            if tx.send(chunk_to_send).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("Error reading fragment file: {}", e);
+                    break;
+                }
+            }
+        }
+        
+        // Send any remaining fragments
+        if !fragments.is_empty() {
+            total_fragments += fragments.len();
+            let _ = tx.send(fragments);
+        }
+        
+        eprintln!("\nFinished reading {} total fragments", total_fragments);
+    });
+    
+    // Cache for chromosome lookups to improve performance
     let mut current_chrom = String::new();
-    let mut current_lapper: Option<&mut Lapper<u32, usize>> = None;
-    let mut cursor: usize = 0;
+    let mut current_lapper: Option<&Lapper<u32, usize>> = None;
+    let mut cursor = 0;
     let mut check_end: bool;
 
-    loop {
-
-        match reader.read_line(&mut line_str) {
-            Ok(0) => break,
-            Ok(_) => {},
-            Err(e) => {
-                error!("Error reading fragment file: {}", e);
-                return Err(e);
+    let mut startpos: u32;
+    let mut endpos: u32;
+    
+    // Process chunks from the channel
+    for chunk in rx {
+        for line in chunk {            
+            // Parse BED entry
+            let fields = line.split('\t').collect::<SmallVec<[&str; 10]>>();
+            if fields.len() < 4 {
+                continue;
             }
-        }
-        let line = &line_str[..line_str.len() - 1];
-
-        // Skip header lines that start with #
-        if line.starts_with('#') {
-            line_str.clear();
-            continue;
-        }
-
-        line_count += 1;
-        if line_count % update_interval == 0 {
-            print!("\rProcessed {} M fragments", line_count / 1_000_000);
-            std::io::stdout().flush().expect("Can't flush output");
-        }
-
-        // Parse BED entry
-        let fields: Vec<&str> = line.split('\t').collect();
-
-        // Check if cell is to be included
-        let cell_barcode: &str = fields[3];
-        if let Some(&cell_index) = cells.get(cell_barcode) {
-            check_end = true;
-
-            // create intervals from fragment entry
-            let seqname: &str = fields[0];
-
-            if seqname != current_chrom {
-                current_chrom = seqname.to_string();
-                current_lapper = peaks.get_mut(&current_chrom);
-                cursor = 0;
-            }
-
-            // try to parse the coordinates, skip the line if parsing fails
-            startpos = match fields[1].trim().parse() {
-                Ok(num) => num,
-                Err(e) => {
-                    warn!("Failed to parse start position: {:?}. Error: {}", line_count, e);
-                    line_str.clear();
-                    continue;
-                }
-            };
             
-            endpos = match fields[2].trim().parse() {
-                Ok(num) => num,
-                Err(e) => {
-                    warn!("Failed to parse end position: {:?}. Error: {}", line_count, e);
-                    line_str.clear();
-                    continue;
-                }
-            };
-
-            // From Paired Insertion Counting paper
-            // https://www.nature.com/articles/s41592-023-02103-7
-            //
-            // In PIC, for a given chromosome interval, if the pair of insertions of an ATAC-seq fragment
-            // are both within the interval, they are counted as one (pair); if only one insertion is within
-            // the interval and the other is outside the interval, also count one (pair).
-
-            if let Some(lapper) = &mut current_lapper {
-                // seems to be a problem with seek if lapper has one element
-                // set cursor to 0
-                if lapper.intervals.len() == 1 {
+            // Check if cell is to be included
+            let cell_barcode: &str = fields[3];
+            if let Some(&cell_index) = cells.get(cell_barcode) {
+                check_end = true;
+                
+                // Create intervals from fragment entry
+                let seqname: &str = fields[0];
+                
+                // Update lapper if chromosome changed
+                if seqname != current_chrom {
+                    current_chrom = seqname.to_string();
+                    current_lapper = peaks.get(&current_chrom);
                     cursor = 0;
                 }
-                for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
-                    let peak_index = interval.val;
-                    let peak_end = interval.stop;
-                    *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                
+                // Try to parse the coordinates, skip the line if parsing fails
+                startpos = match fields[1].trim().parse() {
+                    Ok(num) => num,
+                    Err(_) => continue,
+                };
+                
+                endpos = match fields[2].trim().parse() {
+                    Ok(num) => num,
+                    Err(_) => continue,
+                };
+                
+                if let Some(lapper) = &current_lapper {
+                    // seems to be a problem with seek if lapper has one element
+                    // set cursor to 0
+                    if lapper.intervals.len() == 1 {
+                        cursor = 0;
+                    }
 
-                    if endpos < peak_end {
-                        // Check if fragment end is behind peak end (if so, it overlaps and we don't need a full search)
-                        check_end = false;
+                    // Check for overlaps at start position
+                    for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
+                        let peak_index = interval.val;
+                        let peak_end = interval.stop;
+                        *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
                         
-                        // if PIC, count one only for pair
-                        if !pic {
+                        if endpos < peak_end {
+                            // Check if fragment end is behind peak end (it overlaps)
+                            check_end = false;
+                            
+                            // From Paired Insertion Counting paper
+                            // https://www.nature.com/articles/s41592-023-02103-7
+                            //
+                            // In PIC, for a given chromosome interval, if the pair of insertions of an ATAC-seq fragment
+                            // are both within the interval, they are counted as one (pair); if only one insertion is within
+                            // the interval and the other is outside the interval, also count one (pair).
+                            if !pic {
+                                *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    
+                    // Check for overlaps at end position if needed
+                    if check_end {
+                        for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
+                            let peak_index = interval.val;
                             *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
                         }
                     }
                 }
-                if check_end {
-                    for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
-                        let peak_index = interval.val;
-                        *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
-                    }
-                }
             }
         }
-        line_str.clear();
     }
-    eprintln!();
+    
+    // Wait for reader thread to complete
+    reader_handle.join().expect("Reader thread panicked");
     
     // write count matrix
     let counts_path = output.join("matrix.mtx.gz");
