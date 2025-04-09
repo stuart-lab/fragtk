@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashMap;
 use log::info;
-
+use std::fs;
 
 pub fn cellselect(
     fragments: &str,
@@ -118,8 +118,16 @@ fn top_barcodes(
 }
 
 fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<String, usize>> {
-    // hashmap for cell barcode counts
-    let mut cells: FxHashMap<String, usize> = FxHashMap::default();
+
+    let metadata = fs::metadata(&frag_file)?;
+    let file_size = metadata.len() as usize;
+    let estimated_lines: usize = file_size / 100;
+    let estimated_cell_count: usize = (estimated_lines / 10_000).max(1000);
+
+    let mut cells: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(
+        estimated_cell_count, 
+        Default::default()
+    );
 
     // Create a channel for communication between the decompression and processing threads
     let (tx, rx) = mpsc::sync_channel(100);
@@ -190,22 +198,27 @@ fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<String, usize>> {
     // Process chunks from the channel
     for chunk in rx {
         for line in chunk {
-            // Count barcodes from each line
-            let fields = line.split('\t').collect::<smallvec::SmallVec<[&str; 10]>>();
-            // let fields: Vec<&str> = line.split('\t').collect();
+
+            let mut field_idx = 0;
+            let mut cell_barcode = None;
             
-            // Update count for cell barcode
-            if let Some(cell_barcode) = fields.get(3) {
-                let cell_barcode = cell_barcode.to_string();
-                *cells.entry(cell_barcode).or_insert(0) += 1;
+            for field in line.split('\t') {
+                if field_idx == 3 {
+                    cell_barcode = Some(field);
+                    break;
+                }
+                field_idx += 1;
+            }
+            
+            if let Some(barcode) = cell_barcode {
+                let barcode_string = barcode.to_string();
+                *cells.entry(barcode_string).or_insert(0) += 1;
             }
         }
     }
-    eprintln!();
 
     // Join thread to ensure it completes
     decompress_handle.join().expect("Failed to join decompression thread");
-
     eprintln!("Found {} unique cell barcodes", cells.len());
     Ok(cells)
 }
