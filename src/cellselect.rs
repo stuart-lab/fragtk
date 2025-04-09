@@ -11,6 +11,7 @@ use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashMap;
 use log::info;
 
+
 pub fn cellselect(
     fragments: &str,
     outfile: &str,
@@ -116,50 +117,88 @@ fn top_barcodes(
     Ok(selected)
 }
 
-fn count_barcodes(frag_file: &Path,) -> io::Result<FxHashMap<String, usize>> {
-
+fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<String, usize>> {
     // hashmap for cell barcode counts
     let mut cells: FxHashMap<String, usize> = FxHashMap::default();
 
     // Create a channel for communication between the decompression and processing threads
-    let (tx, rx) = mpsc::sync_channel(500);
+    let (tx, rx) = mpsc::sync_channel(100);
 
     // Spawn the decompression thread
     let frag_file = frag_file.to_path_buf();
     let decompress_handle = thread::spawn(move || {
-        let reader = BufReader::new(MultiGzDecoder::new(File::open(frag_file).expect("Failed to open fragment file")));
-        for line in reader.lines() {
-            let line = line.expect("Failed to read line");
-            if tx.send(line).is_err() {
-                break;
+        // Open the fragment file
+        let file = match File::open(&frag_file) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to open fragment file: {}", e);
+                return;
+            }
+        };
+        
+        // Create buffered reader
+        let reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(file));
+        
+        // Number of lines to read in each chunk
+        const CHUNK_SIZE: usize = 10_000;
+        let mut lines = Vec::with_capacity(CHUNK_SIZE);
+        let mut total_lines = 0;
+        
+        // Read the file line by line
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    // Skip header lines
+                    if !line.starts_with('#') {
+                        lines.push(line);
+                        
+                        // When we have a full chunk, send it to the processing thread
+                        if lines.len() >= CHUNK_SIZE {
+                            total_lines += lines.len();
+                            
+                            // Report progress
+                            if total_lines % 1_000_000 == 0 {
+                                eprint!("\rProcessed {} M fragments", total_lines / 1_000_000);
+                                std::io::stderr().flush().unwrap();
+                            }
+                            
+                            // Create a new vector and send the current one
+                            let chunk_to_send = std::mem::replace(&mut lines, Vec::with_capacity(CHUNK_SIZE));
+                            if tx.send(chunk_to_send).is_err() {
+                                // Channel closed, receiver dropped
+                                break;
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error reading line: {}", e);
+                    break;
+                }
             }
         }
+        
+        // Send any remaining lines
+        if !lines.is_empty() {
+            total_lines += lines.len();
+            let _ = tx.send(lines);
+        }
+        
+        eprintln!("\nFinished reading {} total fragments", total_lines);
     });
 
-    // Progress counter
-    let mut line_count: u64 = 0;
-    let update_interval = 1_000_000;
-
-    for line in rx {
-
-        // Skip header lines that start with #
-        if line.starts_with('#') {
-            continue;
-        }
-
-        line_count += 1;
-        if line_count % update_interval == 0 {
-            eprint!("\rProcessed {} M fragments", line_count / 1_000_000 );
-            std::io::stdout().flush().expect("Can't flush output");
-        }
-
-        // parse bed entry
-        let fields: Vec<&str> = line.split('\t').collect();
-
-        // update count for cell barcode
-        if let Some(cell_barcode) = fields.get(3) {
-            let cell_barcode = cell_barcode.to_string();
-            *cells.entry(cell_barcode).or_insert(0) += 1;
+    // Process chunks from the channel
+    for chunk in rx {
+        for line in chunk {
+            // Count barcodes from each line
+            let fields = line.split('\t').collect::<smallvec::SmallVec<[&str; 10]>>();
+            // let fields: Vec<&str> = line.split('\t').collect();
+            
+            // Update count for cell barcode
+            if let Some(cell_barcode) = fields.get(3) {
+                let cell_barcode = cell_barcode.to_string();
+                *cells.entry(cell_barcode).or_insert(0) += 1;
+            }
         }
     }
     eprintln!();
@@ -167,5 +206,6 @@ fn count_barcodes(frag_file: &Path,) -> io::Result<FxHashMap<String, usize>> {
     // Join thread to ensure it completes
     decompress_handle.join().expect("Failed to join decompression thread");
 
+    eprintln!("Found {} unique cell barcodes", cells.len());
     Ok(cells)
 }
