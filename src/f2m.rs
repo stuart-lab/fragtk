@@ -362,7 +362,7 @@ fn write_matrix_market(
         .from_writer(writer);
 
     // Create a string buffer to collect all lines
-    let mut output = String::new();
+    let mut output = String::with_capacity(8 * 1024 * 1024);
 
     // Write the header for the Matrix Market format
     output.push_str("%%MatrixMarket matrix coordinate integer general\n");
@@ -371,15 +371,26 @@ fn write_matrix_market(
     encoder.write_all(output.as_bytes())?;
     output.clear();
 
+    const CHUNK_SIZE: usize = 50_000;
+    let mut entries_in_chunk = 0;
+
     // Collect each peak-cell-count entry into the string buffer
     for (index, hashmap) in peak_cell_counts.iter().enumerate() {
         for (key, value) in hashmap.iter() {
-            output.push_str(&format!("{} {} {}\n", index + 1, key + 1, value)); // +1 to convert 0-based to 1-based indices
+            output.push_str(&(index + 1).to_string());
+            output.push(' ');
+            output.push_str(&(key + 1).to_string());
+            output.push(' ');
+            output.push_str(&value.to_string());
+            output.push('\n');
+
+            entries_in_chunk += 1;
         }
         // write chunk, clear string
-        if index % 5000 == 0 {
+        if entries_in_chunk >= CHUNK_SIZE {
             encoder.write_all(output.as_bytes())?;
             output.clear();
+            entries_in_chunk = 0;
         }
     }
 
