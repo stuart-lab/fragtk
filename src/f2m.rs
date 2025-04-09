@@ -10,6 +10,7 @@ use std::{
     sync::mpsc,
     thread,
 };
+use std::fmt::Write as FmtWrite; // for write! on String
 use rust_lapper::{Interval, Lapper};
 use flate2::read::MultiGzDecoder;
 use flate2::Compression;
@@ -22,6 +23,7 @@ use gzp::{
     par::compress::{ParCompress, ParCompressBuilder},
 };
 use smallvec::SmallVec;
+use lexical_core::parse;
 
 pub fn f2m(
     fragments: &str,
@@ -132,7 +134,7 @@ fn fcount(
     info!("Loaded {} cell barcodes", cell_count);
     
     // Estimate an average of cells per peak for preallocation 
-    let avg_cells_per_peak = cell_count.min(1000);
+    let avg_cells_per_peak = (cell_count / 5).min(1000);
 
     // vector of features
     // each element is hashmap of cell: count
@@ -239,12 +241,14 @@ fn fcount(
                 }
                 
                 // Try to parse the coordinates, skip the line if parsing fails
-                startpos = match fields[1].trim().parse() {
+                startpos = match parse::<u32>(fields[1].trim().as_bytes()) {
+                // startpos = match fields[1].trim().parse() {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
                 
-                endpos = match fields[2].trim().parse() {
+                endpos = match parse::<u32>(fields[2].trim().as_bytes()) {
+                // endpos = match fields[2].trim().parse() {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
@@ -362,7 +366,7 @@ fn write_matrix_market(
         .from_writer(writer);
 
     // Create a string buffer to collect all lines
-    let mut output = String::with_capacity(8 * 1024 * 1024);
+    let mut output = String::with_capacity(2 * 1024 * 1024);
 
     // Write the header for the Matrix Market format
     output.push_str("%%MatrixMarket matrix coordinate integer general\n");
@@ -374,25 +378,27 @@ fn write_matrix_market(
     const CHUNK_SIZE: usize = 50_000;
     let mut entries_in_chunk = 0;
 
-    // Collect each peak-cell-count entry into the string buffer
     for (index, hashmap) in peak_cell_counts.iter().enumerate() {
         for (key, value) in hashmap.iter() {
-            output.push_str(&(index + 1).to_string());
-            output.push(' ');
-            output.push_str(&(key + 1).to_string());
-            output.push(' ');
-            output.push_str(&value.to_string());
-            output.push('\n');
-
+            write!(
+                &mut output,
+                "{} {} {}\n",
+                index + 1,
+                key + 1,
+                value
+            ).unwrap(); 
+    
             entries_in_chunk += 1;
-        }
-        // write chunk, clear string
-        if entries_in_chunk >= CHUNK_SIZE {
-            encoder.write_all(output.as_bytes())?;
-            output.clear();
-            entries_in_chunk = 0;
+    
+            if entries_in_chunk >= CHUNK_SIZE {
+                encoder.write_all(output.as_bytes())?;
+                output.clear();
+                entries_in_chunk = 0;
+            }
         }
     }
+
+    println!("{}", output.capacity());
 
     // Write the remaining string buffer
     if !output.is_empty() {
@@ -454,6 +460,7 @@ fn peak_intervals(
                 if fields.len() >= 3 {
                     let chromosome = fields[0].to_string();
                     let start: u32 = match fields[1].parse() {
+                    // let start: u32 = match parse::<u32>(fields[1].trim().as_bytes()) {
                         Ok(num) => num,
                         Err(_) => {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, 
