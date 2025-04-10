@@ -12,12 +12,12 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4.1", features = ["derive"] }
 flate2 = { version = "1.0.30", features = ["zlib-ng"], default-features = false }
-gzp = "0.11.3"
+gzp = "1.0.1"
 log = "0.4.22"
 pretty_env_logger = "0.5.0"
 rust-lapper = "1.1.0"
 rustc-hash = "2.0.0"
-tikv-jemallocator = "0.5"
+tikv-jemallocator = "0.6.0"
 clap_mangen = "0.2"
 smallvec = "1.15.0"
 lexical-core = "1.0.5"
