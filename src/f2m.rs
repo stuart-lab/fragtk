@@ -240,15 +240,14 @@ fn fcount(
                     cursor = 0;
                 }
                 
-                // Try to parse the coordinates, skip the line if parsing fails
-                startpos = match parse::<u32>(fields[1].trim().as_bytes()) {
-                // startpos = match fields[1].trim().parse() {
+                let start_str = fields[1];
+                let end_str = fields[2];
+                startpos = match parse::<u32>(start_str.as_bytes()) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
                 
-                endpos = match parse::<u32>(fields[2].trim().as_bytes()) {
-                // endpos = match fields[2].trim().parse() {
+                endpos = match parse::<u32>(end_str.as_bytes()) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
@@ -297,6 +296,10 @@ fn fcount(
     // Wait for reader thread to complete
     reader_handle.join().expect("Reader thread panicked");
     
+    for counts in &mut peak_cell_counts {
+        counts.shrink_to_fit();
+    }
+
     // write count matrix
     let counts_path = output.join("matrix.mtx.gz");
     info!("Writing output counts file: {:?}", &counts_path);
@@ -398,8 +401,6 @@ fn write_matrix_market(
         }
     }
 
-    println!("{}", output.capacity());
-
     // Write the remaining string buffer
     if !output.is_empty() {
         encoder.write_all(output.as_bytes())?;
@@ -456,18 +457,17 @@ fn peak_intervals(
                     skipped_lines += 1;
                     continue;
                 }
-                let fields: Vec<&str> = line.split('\t').collect();
+                let fields = line.split('\t').collect::<SmallVec<[&str; 10]>>();
                 if fields.len() >= 3 {
                     let chromosome = fields[0].to_string();
-                    let start: u32 = match fields[1].parse() {
-                    // let start: u32 = match parse::<u32>(fields[1].trim().as_bytes()) {
+                    let start: u32 = match parse::<u32>(fields[1].trim().as_bytes()) {
                         Ok(num) => num,
                         Err(_) => {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, 
                                 format!("Line {}: Failed to parse start position", index + 1)));
                         }
                     };
-                    let end: u32 = match fields[2].parse() {
+                    let end: u32 = match parse::<u32>(fields[2].trim().as_bytes()) {
                         Ok(num) => num,
                         Err(_) => {
                             return Err(io::Error::new(io::ErrorKind::InvalidData,
