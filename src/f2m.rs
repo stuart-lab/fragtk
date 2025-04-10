@@ -24,6 +24,7 @@ use gzp::{
 };
 use smallvec::SmallVec;
 use lexical_core::parse;
+use itoa;
 
 pub fn f2m(
     fragments: &str,
@@ -374,22 +375,32 @@ fn write_matrix_market(
     // Write the header for the Matrix Market format
     output.push_str("%%MatrixMarket matrix coordinate integer general\n");
     output.push_str(&format!("%%metadata json: {{\"software_version\": \"fragtk-{}\"}}\n", env!("CARGO_PKG_VERSION")));
-    output.push_str(&format!("{} {} {}\n", nrow, ncol, nonzero));
+    output.push_str(&itoa::Buffer::new().format(nrow));
+    output.push(' ');
+    output.push_str(&itoa::Buffer::new().format(ncol));
+    output.push(' ');
+    output.push_str(&itoa::Buffer::new().format(nonzero));
+    output.push('\n');
     encoder.write_all(output.as_bytes())?;
     output.clear();
 
     const CHUNK_SIZE: usize = 50_000;
     let mut entries_in_chunk = 0;
 
+    let mut row_buf = itoa::Buffer::new();
+    let mut col_buf = itoa::Buffer::new();
+    let mut val_buf = itoa::Buffer::new();
+
     for (index, hashmap) in peak_cell_counts.iter().enumerate() {
         for (key, value) in hashmap.iter() {
+
             write!(
                 &mut output,
                 "{} {} {}\n",
-                index + 1,
-                key + 1,
-                value
-            ).unwrap(); 
+                row_buf.format(index + 1),
+                col_buf.format(key + 1),
+                val_buf.format(*value)
+            ).unwrap();
     
             entries_in_chunk += 1;
     
