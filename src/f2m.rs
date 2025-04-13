@@ -133,18 +133,12 @@ fn fcount(
     // Estimate the peak-cell count map size for preallocation
     let cell_count = cells.len();
     info!("Loaded {} cell barcodes", cell_count);
-    
-    // Estimate an average of cells per peak for preallocation 
-    let avg_cells_per_peak = (cell_count / 5).min(1000);
 
     // vector of features
     // each element is hashmap of cell: count
     let mut peak_cell_counts: Vec<FxHashMap<u32, u32>> = Vec::with_capacity(total_peaks);
     for _ in 0..total_peaks {
-        peak_cell_counts.push(FxHashMap::with_capacity_and_hasher(
-            avg_cells_per_peak, 
-            Default::default()
-        ));
+        peak_cell_counts.push(FxHashMap::default());
     }
 
     // Create a channel for communication between threads
