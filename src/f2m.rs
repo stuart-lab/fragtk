@@ -10,7 +10,7 @@ use std::{
     sync::mpsc,
     thread,
 };
-use std::fmt::Write as FmtWrite; // for write! on String
+use std::fmt::Write as FmtWrite;
 use rust_lapper::{Interval, Lapper};
 use flate2::read::MultiGzDecoder;
 use flate2::Compression;
@@ -258,7 +258,9 @@ fn fcount(
                     for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
                         let peak_index = interval.val;
                         let peak_end = interval.stop;
-                        *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                        peak_cell_counts[peak_index].entry(cell_index)
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
                         
                         if endpos < peak_end {
                             // Check if fragment end is behind peak end (it overlaps)
@@ -271,7 +273,9 @@ fn fcount(
                             // are both within the interval, they are counted as one (pair); if only one insertion is within
                             // the interval and the other is outside the interval, also count one (pair).
                             if !pic {
-                                *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                                peak_cell_counts[peak_index].entry(cell_index)
+                                    .and_modify(|count| *count += 1)
+                                    .or_insert(1);
                             }
                         }
                     }
@@ -280,7 +284,9 @@ fn fcount(
                     if check_end {
                         for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
                             let peak_index = interval.val;
-                            *peak_cell_counts[peak_index].entry(cell_index).or_insert(0) += 1;
+                            peak_cell_counts[peak_index].entry(cell_index)
+                                .and_modify(|count| *count += 1)
+                                .or_insert(1);
                         }
                     }
                 }

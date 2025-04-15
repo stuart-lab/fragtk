@@ -82,7 +82,7 @@ enum Commands {
             long,
             value_name = "NUMBER",
             help = "Number of compression threads to use",
-            default_value = "4",
+            default_value = "2",
             value_parser = clap::value_parser!(usize)
         )]
         threads: usize,
