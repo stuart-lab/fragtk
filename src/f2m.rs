@@ -330,6 +330,7 @@ fn fcount(
 
     // write remaining counts to file
     write_matrix_market(&temp_path, &peak_cell_counts, num_threads)?;
+    nonzero_counts += peak_cell_counts.len() as u64;
     peak_cell_counts.clear();
 
     // write mtx header with proper gzip compression
