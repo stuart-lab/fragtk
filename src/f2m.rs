@@ -26,6 +26,8 @@ use smallvec::SmallVec;
 use lexical_core::parse;
 use itoa;
 
+const MAX_COUNT: u32 = u16::MAX as u32;
+
 pub fn f2m(
     fragments: &str,
     bed: &str,
@@ -136,7 +138,7 @@ fn fcount(
 
     // vector of features
     // each element is hashmap of cell: count
-    let mut peak_cell_counts: Vec<FxHashMap<u32, u32>> = Vec::with_capacity(total_peaks);
+    let mut peak_cell_counts: Vec<FxHashMap<u32, u16>> = Vec::with_capacity(total_peaks);
     for _ in 0..total_peaks {
         peak_cell_counts.push(FxHashMap::default());
     }
@@ -258,9 +260,10 @@ fn fcount(
                     for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
                         let peak_index = interval.val;
                         let peak_end = interval.stop;
-                        peak_cell_counts[peak_index].entry(cell_index)
-                            .and_modify(|count| *count += 1)
-                            .or_insert(1);
+                        let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                        if *count < MAX_COUNT as u16 {
+                            *count += 1;
+                        }
                         
                         if endpos < peak_end {
                             // Check if fragment end is behind peak end (it overlaps)
@@ -273,9 +276,10 @@ fn fcount(
                             // are both within the interval, they are counted as one (pair); if only one insertion is within
                             // the interval and the other is outside the interval, also count one (pair).
                             if !pic {
-                                peak_cell_counts[peak_index].entry(cell_index)
-                                    .and_modify(|count| *count += 1)
-                                    .or_insert(1);
+                                let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                                if *count < MAX_COUNT as u16 {
+                                    *count += 1;
+                                }
                             }
                         }
                     }
@@ -284,9 +288,10 @@ fn fcount(
                     if check_end {
                         for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
                             let peak_index = interval.val;
-                            peak_cell_counts[peak_index].entry(cell_index)
-                                .and_modify(|count| *count += 1)
-                                .or_insert(1);
+                            let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                            if *count < MAX_COUNT as u16 {
+                                *count += 1;
+                            }
                         }
                     }
                 }
@@ -352,7 +357,7 @@ fn write_cells(
 
 fn write_matrix_market(
     outfile: &Path,
-    peak_cell_counts: &[FxHashMap<u32, u32>],
+    peak_cell_counts: &[FxHashMap<u32, u16>],
     nrow: usize,
     ncol: usize,
     num_threads: usize,
