@@ -1,3 +1,7 @@
+# 1.5.0
+
+- Speed and memory improvements
+
 # 1.4.0
 
 - Enable `--cells` file to be gzipped
