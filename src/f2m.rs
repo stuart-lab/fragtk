@@ -5,15 +5,18 @@ use std::{
     error::Error,
     fs::File,
     io::BufReader,
+    io::BufWriter,
     io::BufRead,
     io::Write,
     sync::mpsc,
     thread,
+    fs::OpenOptions,
 };
 use std::fmt::Write as FmtWrite;
 use rust_lapper::{Interval, Lapper};
 use flate2::read::MultiGzDecoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use log::error;
 use log::info;
 use rustc_hash::FxHashMap;
@@ -25,6 +28,7 @@ use gzp::{
 use smallvec::SmallVec;
 use lexical_core::parse;
 use itoa;
+use tempfile::NamedTempFile;
 
 const MAX_COUNT: u32 = u16::MAX as u32;
 
@@ -132,16 +136,15 @@ fn fcount(
         cells.insert(line, index_u32);
     }
     
-    // Estimate the peak-cell count map size for preallocation
     let cell_count = cells.len();
     info!("Loaded {} cell barcodes", cell_count);
 
     // vector of features
     // each element is hashmap of cell: count
-    let mut peak_cell_counts: Vec<FxHashMap<u32, u16>> = Vec::with_capacity(total_peaks);
-    for _ in 0..total_peaks {
-        peak_cell_counts.push(FxHashMap::default());
-    }
+    // let mut peak_cell_counts: Vec<FxHashMap<u32, u16>> = Vec::with_capacity(total_peaks);
+    // for _ in 0..total_peaks {
+    //     peak_cell_counts.push(FxHashMap::default());
+    // }
 
     // Create a channel for communication between threads
     let (tx, rx) = mpsc::sync_channel(100);
@@ -209,6 +212,18 @@ fn fcount(
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
     let mut cursor = 0;
     let mut check_end: bool;
+    let temp_file = NamedTempFile::new()?;
+    let temp_path = temp_file.path().to_str().unwrap().to_string();
+
+    info!("temp_file: {:?}", temp_file.path().to_str().unwrap());
+
+    let mut nonzero_counts: u64 = 0;
+
+    let mut past_chromosomes: Vec<String> = Vec::new();
+    
+    // hashmap of peak-cell: count
+    // this is for one chromosome at a time
+    let mut peak_cell_counts: FxHashMap<(u32, u32), u16> = FxHashMap::default();
 
     let mut startpos: u32;
     let mut endpos: u32;
@@ -230,11 +245,22 @@ fn fcount(
                 // Create intervals from fragment entry
                 let seqname: &str = fields[0];
                 
-                // Update lapper if chromosome changed
+                // check if chromosome changed
+                // if so: update lapper, write previous chromosome's counts to file, reset peak_cell_counts
                 if seqname != current_chrom {
+                    if past_chromosomes.contains(&seqname.to_string()) {
+                        // throw error, entries not sorted
+                        error!("Entries not sorted: {}", line);
+                        std::process::exit(1);
+                    }
+                    info!("Writing counts for chromosome: {}", current_chrom);
+                    past_chromosomes.push(current_chrom.clone()); // remember what has been processed
                     current_chrom = seqname.to_string();
                     current_lapper = peaks.get(&current_chrom);
                     cursor = 0;
+                    nonzero_counts += peak_cell_counts.len() as u64;
+                    write_matrix_market(&temp_path, &peak_cell_counts, num_threads)?;
+                    peak_cell_counts.clear();
                 }
                 
                 let start_str = fields[1];
@@ -258,9 +284,9 @@ fn fcount(
 
                     // Check for overlaps at start position
                     for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
-                        let peak_index = interval.val;
+                        let peak_index = interval.val as u32;
                         let peak_end = interval.stop;
-                        let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                        let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
                         if *count < MAX_COUNT as u16 {
                             *count += 1;
                         }
@@ -276,7 +302,7 @@ fn fcount(
                             // are both within the interval, they are counted as one (pair); if only one insertion is within
                             // the interval and the other is outside the interval, also count one (pair).
                             if !pic {
-                                let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                                let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
                                 if *count < MAX_COUNT as u16 {
                                     *count += 1;
                                 }
@@ -287,8 +313,8 @@ fn fcount(
                     // Check for overlaps at end position if needed
                     if check_end {
                         for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
-                            let peak_index = interval.val;
-                            let count = peak_cell_counts[peak_index].entry(cell_index).or_insert(0);
+                            let peak_index = interval.val as u32;
+                            let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
                             if *count < MAX_COUNT as u16 {
                                 *count += 1;
                             }
@@ -301,18 +327,37 @@ fn fcount(
     
     // Wait for reader thread to complete
     reader_handle.join().expect("Reader thread panicked");
-    
-    for counts in &mut peak_cell_counts {
-        counts.shrink_to_fit();
+
+    // write remaining counts to file
+    write_matrix_market(&temp_path, &peak_cell_counts, num_threads)?;
+    peak_cell_counts.clear();
+
+    // write mtx header with proper gzip compression
+    info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
+    let output_file = File::create(output.join("matrix.mtx.gz"))?;
+    let mut header = Vec::new();
+    {
+        let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
+        writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
+        writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
+        writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
+        header_writer.flush()?;
     }
+    
+    // Write gzipped header and concatenate with gzipped counts
+    info!("Copying counts to output file");
+    let mut output_writer = BufWriter::new(output_file);
+    output_writer.write_all(&header)?;
+    let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
+    io::copy(&mut temp_reader, &mut output_writer)?;
+    output_writer.flush()?;
 
-    // write count matrix
-    let counts_path = output.join("matrix.mtx.gz");
-    info!("Writing output counts file: {:?}", &counts_path);
-    write_matrix_market(&counts_path, &peak_cell_counts, total_peaks, cells.len(), num_threads)
-        .expect("Failed to write matrix"); // features stored as rows
-
+    // Clean up the temporary data file
+    info!("Removing temporary data file: {:?}", temp_file.path());
+    std::fs::remove_file(temp_file.path().to_str().unwrap())?;
+    
     // write cells
+    info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
     let cell_path = output.join("barcodes.tsv.gz");
     info!("Writing output cells file: {:?}", &cell_path);
     write_cells(&cell_path, cell_file, num_threads)
@@ -356,39 +401,28 @@ fn write_cells(
 }
 
 fn write_matrix_market(
-    outfile: &Path,
-    peak_cell_counts: &[FxHashMap<u32, u16>],
-    nrow: usize,
-    ncol: usize,
+    file_path: &str,
+    peak_cell_counts: &FxHashMap<(u32, u32), u16>,
     num_threads: usize,
 ) -> io::Result<()> {
 
-    // get nonzero value count
-    let nonzero: usize = peak_cell_counts.iter().map(|map| map.len()).sum();
+    // write count information only
+    // header not written
 
-    // create output file
-    let writer = File::create(outfile)?;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(file_path)?;
+
     let mut encoder: ParCompress<Gzip> = ParCompressBuilder::new()
-        .compression_level(Compression::default())  // Set compression level
+        .compression_level(Compression::default())
         .num_threads(num_threads)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))? 
-        .from_writer(writer);
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .from_writer(file);
 
     // Create a string buffer to collect all lines
     let mut output = String::with_capacity(2 * 1024 * 1024);
-
-    // Write the header for the Matrix Market format
-    output.push_str("%%MatrixMarket matrix coordinate integer general\n");
-    output.push_str(&format!("%%metadata json: {{\"software_version\": \"fragtk-{}\"}}\n", env!("CARGO_PKG_VERSION")));
-    output.push_str(&itoa::Buffer::new().format(nrow));
-    output.push(' ');
-    output.push_str(&itoa::Buffer::new().format(ncol));
-    output.push(' ');
-    output.push_str(&itoa::Buffer::new().format(nonzero));
-    output.push('\n');
-    encoder.write_all(output.as_bytes())?;
-    output.clear();
-
     const CHUNK_SIZE: usize = 50_000;
     let mut entries_in_chunk = 0;
 
@@ -396,14 +430,13 @@ fn write_matrix_market(
     let mut col_buf = itoa::Buffer::new();
     let mut val_buf = itoa::Buffer::new();
 
-    for (index, hashmap) in peak_cell_counts.iter().enumerate() {
-        for (key, value) in hashmap.iter() {
+    for (key, value) in peak_cell_counts.iter() {
 
             write!(
                 &mut output,
                 "{} {} {}\n",
-                row_buf.format(index + 1),
-                col_buf.format(key + 1),
+                row_buf.format(key.0 + 1),
+                col_buf.format(key.1 + 1),
                 val_buf.format(*value)
             ).unwrap();
     
@@ -413,7 +446,6 @@ fn write_matrix_market(
                 encoder.write_all(output.as_bytes())?;
                 output.clear();
                 entries_in_chunk = 0;
-            }
         }
     }
 
@@ -422,6 +454,7 @@ fn write_matrix_market(
         encoder.write_all(output.as_bytes())?;
     }
 
+    encoder.flush()?;
     encoder.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     Ok(())
