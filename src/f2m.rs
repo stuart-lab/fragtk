@@ -139,15 +139,35 @@ fn fcount(
     let cell_count = cells.len();
     info!("Loaded {} cell barcodes", cell_count);
 
-    // vector of features
-    // each element is hashmap of cell: count
-    // let mut peak_cell_counts: Vec<FxHashMap<u32, u16>> = Vec::with_capacity(total_peaks);
-    // for _ in 0..total_peaks {
-    //     peak_cell_counts.push(FxHashMap::default());
-    // }
-
-    // Create a channel for communication between threads
+    // Create channels for communication between threads
     let (tx, rx) = mpsc::sync_channel(100);
+    let (counts_tx, counts_rx) = mpsc::sync_channel(3); // smaller buffer, this is per chromosome
+
+    let temp_file = NamedTempFile::new()?;
+    let temp_path_clone = temp_file.path().to_str().unwrap().to_string();
+    info!("temp_file: {:?}", temp_path_clone);
+
+    let writer_threads = num_threads;
+
+    // Spawn writer thread first
+    let writer_handle = thread::spawn(move || -> io::Result<()> {
+        let mut result = Ok(());
+        while let Ok((counts, is_last)) = counts_rx.recv() {
+            match write_matrix_market(&temp_path_clone, &counts, writer_threads) {
+                Ok(_) => {
+                    if is_last {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Error writing matrix market: {}", e);
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        result
+    });
     
     // Spawn thread for decompression and reading
     let frag_file = frag_file.to_path_buf();
@@ -206,27 +226,14 @@ fn fcount(
         
         eprintln!("\nFinished reading {} total fragments", total_fragments);
     });
-    
-    // Cache for chromosome lookups to improve performance
+
+    let mut nonzero_counts: u64 = 0;
+    let mut past_chromosomes: Vec<String> = Vec::new();
+    let mut peak_cell_counts: FxHashMap<(u32, u32), u16> = FxHashMap::default();
     let mut current_chrom = String::new();
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
     let mut cursor = 0;
     let mut check_end: bool;
-    let temp_file = NamedTempFile::new()?;
-    let temp_path = temp_file.path().to_str().unwrap().to_string();
-
-    info!("temp_file: {:?}", temp_file.path().to_str().unwrap());
-
-    let mut nonzero_counts: u64 = 0;
-
-    let mut past_chromosomes: Vec<String> = Vec::new();
-    
-    // hashmap of peak-cell: count
-    // this is for one chromosome at a time
-    let mut peak_cell_counts: FxHashMap<(u32, u32), u16> = FxHashMap::default();
-
-    let mut startpos: u32;
-    let mut endpos: u32;
     
     // Process chunks from the channel
     for chunk in rx {
@@ -259,18 +266,25 @@ fn fcount(
                     current_lapper = peaks.get(&current_chrom);
                     cursor = 0;
                     nonzero_counts += peak_cell_counts.len() as u64;
-                    write_matrix_market(&temp_path, &peak_cell_counts, num_threads)?;
-                    peak_cell_counts.clear();
+                    
+                    // Send current counts to writer thread
+                    if !peak_cell_counts.is_empty() {
+                        // send counts to writer thread, replace with empty hashmap
+                        let counts_to_send = std::mem::replace(&mut peak_cell_counts, FxHashMap::default());
+                        if counts_tx.send((counts_to_send, false)).is_err() {
+                            break;
+                        }
+                    }
                 }
                 
                 let start_str = fields[1];
                 let end_str = fields[2];
-                startpos = match parse::<u32>(start_str.as_bytes()) {
+                let startpos = match parse::<u32>(start_str.as_bytes()) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
                 
-                endpos = match parse::<u32>(end_str.as_bytes()) {
+                let endpos = match parse::<u32>(end_str.as_bytes()) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
@@ -324,14 +338,22 @@ fn fcount(
             }
         }
     }
-    
-    // Wait for reader thread to complete
-    reader_handle.join().expect("Reader thread panicked");
 
-    // write remaining counts to file
-    write_matrix_market(&temp_path, &peak_cell_counts, num_threads)?;
+    // Send final counts and signal completion
     nonzero_counts += peak_cell_counts.len() as u64;
-    peak_cell_counts.clear();
+    let final_counts = std::mem::replace(&mut peak_cell_counts, FxHashMap::default());
+    if let Err(e) = counts_tx.send((final_counts, true)) {
+        error!("Failed to send final counts: {}", e);
+        return Err(io::Error::new(io::ErrorKind::Other, e));
+    }
+    drop(counts_tx);
+
+    // Wait for writer and reader threads to complete
+    reader_handle.join().expect("Reader thread panicked");
+    if let Err(e) = writer_handle.join() {
+        error!("Writer thread panicked: {:?}", e);
+        return Err(io::Error::new(io::ErrorKind::Other, "Writer thread panicked"));
+    }
 
     // write mtx header with proper gzip compression
     info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
@@ -409,7 +431,6 @@ fn write_matrix_market(
 
     // write count information only
     // header not written
-
 
     let file = OpenOptions::new()
         .write(true)
