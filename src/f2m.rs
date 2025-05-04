@@ -271,8 +271,9 @@ fn fcount(
                     if !peak_cell_counts.is_empty() {
                         // send counts to writer thread, replace with empty hashmap
                         let counts_to_send = std::mem::replace(&mut peak_cell_counts, FxHashMap::default());
-                        if counts_tx.send((counts_to_send, false)).is_err() {
-                            break;
+                        if let Err(e) = counts_tx.send((counts_to_send, false)) {
+                            error!("Failed to send chromosome counts: {}", e);
+                            return Err(io::Error::new(io::ErrorKind::Other, e));
                         }
                     }
                 }
@@ -339,6 +340,9 @@ fn fcount(
         }
     }
 
+    // Wait for reader thread to complete
+    reader_handle.join().expect("Reader thread panicked");
+
     // Send final counts and signal completion
     nonzero_counts += peak_cell_counts.len() as u64;
     let final_counts = std::mem::replace(&mut peak_cell_counts, FxHashMap::default());
@@ -346,14 +350,9 @@ fn fcount(
         error!("Failed to send final counts: {}", e);
         return Err(io::Error::new(io::ErrorKind::Other, e));
     }
-    drop(counts_tx);
 
-    // Wait for writer and reader threads to complete
-    reader_handle.join().expect("Reader thread panicked");
-    if let Err(e) = writer_handle.join() {
-        error!("Writer thread panicked: {:?}", e);
-        return Err(io::Error::new(io::ErrorKind::Other, "Writer thread panicked"));
-    }
+    // Wait for writer thread to complete
+    writer_handle.join().expect("Writer thread panicked");
 
     // write mtx header with proper gzip compression
     info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
