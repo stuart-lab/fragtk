@@ -352,7 +352,7 @@ fn fcount(
     }
 
     // Wait for writer thread to complete
-    writer_handle.join().expect("Writer thread panicked");
+    let _ = writer_handle.join().expect("Writer thread panicked");
 
     // write mtx header with proper gzip compression
     info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
