@@ -6,7 +6,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: std::alloc::System = std::alloc::System;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ArgGroup};
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -14,6 +14,7 @@ mod f2m;
 mod cellselect;
 mod filter;
 mod man;
+mod qc;
 
 #[derive(Parser)]
 #[command(
@@ -183,6 +184,51 @@ enum Commands {
     },
 
     #[command(
+        about = "Compute scATAC-seq quality control metrics",
+        long_about = "Compute TSS enrichment, nucleosome signal, total fragments, fraction of reads in promoters (FRiP), and fraction of fragments in mito, chrX, chrY chromosomes.",
+        group(
+            ArgGroup::new("annotation")
+                .required(true)
+                .args(&["gff", "bed"])
+    ))]
+    Qc {
+        #[arg(
+            short, 
+            long,
+            value_name = "FILE",
+            help = "Path to the fragment file",
+            long_help = "Path to the fragment file. The file should be gzipped and contain \
+                         chromosome, start, end, and cell barcode columns tab-separated."
+        )]
+        fragments: String,
+
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            help = "Path to a GFF file containing gene annotations. Supply either a GFF file or BED file, not both.",
+        )]
+        gff: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            help = "Path to a BED file containing TSS positions. Supply either a GFF file or BED file, not both.",
+        )]
+        bed: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            help = "Path to the output file",
+            long_help = "Path to the output file. The file will contain the TSS enrichment for each cell barcode, tab-separated."
+        )]
+        outfile: String,
+    },
+
+    #[command(
         name = "generate-manpages",
         about = "Generate man pages",
         hide = true  // Hide from normal help output
@@ -214,6 +260,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         Commands::GenerateManPages { outdir } => {
             man::generate_manpages(outdir)?;
+        },
+        Commands::Qc { fragments, gff, bed, outfile } => {
+            let (annotation, annotation_is_gff) = match (gff.as_ref(), bed.as_ref()) {
+                (Some(gff_path), None) => (gff_path, true),
+                (None, Some(bed_path)) => (bed_path, false),
+                _ => unreachable!("clap ArgGroup ensures exactly one of gff or bed is present"),
+            };
+            qc::tss_enrichment(fragments, annotation, annotation_is_gff, outfile)?
         },
     }
 

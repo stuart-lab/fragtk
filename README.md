@@ -32,6 +32,14 @@ Filter fragments according to the cell barcodes:
 fragtk filter -f <fragments.tsv.gz> -c <barcodes.txt> | bgzip -c > filtered.tsv.gz
 ```
 
+### Compute QC metrics
+
+Compute scATAC-seq quality control metrics per cell:
+
+```
+fragtk qc -f <fragments.tsv.gz> -o <outfile.tsv.gz> <--gff <genes.gff3.gz> |--bed <tss.bed.gz>>
+```
+
 ## Installation
 
 ### Using cargo

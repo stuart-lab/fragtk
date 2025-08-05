@@ -1,6 +1,6 @@
 [package]
 name = "fragtk"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 authors = ["Tim Stuart <stuartt@gis.a-star.edu.sg>"]
 description = "Fragment file toolkit"
@@ -23,6 +23,8 @@ smallvec = "1.15.0"
 lexical-core = "1.0.5"
 itoa = "1.0"
 tempfile = "3.19.1"
+bio = "2.3.0"
+bio-types = "1.0.4"
 
 [profile.release]
 panic = "abort"
