@@ -1,3 +1,7 @@
+# 1.6.0
+
+- Add `fragtk qc` command
+
 # 1.5.0
 
 - Speed and memory improvements
