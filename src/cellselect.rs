@@ -2,12 +2,7 @@ use std::io;
 use std::error::Error;
 use std::path::Path;
 use std::fs::File;
-use std::io::BufReader;
-use std::io::BufRead;
 use std::io::Write;
-use std::thread;
-use std::sync::mpsc;
-use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashMap;
 use log::info;
 use std::fs;
@@ -35,12 +30,10 @@ pub fn cellselect(
             info!("Cell number cutoff: {:?}", n);
         },
         (None, None) => {
-            eprintln!("Either --threshold or --ncells must be specified");
-            std::process::exit(1);
+            return Err("Either --threshold or --ncells must be specified".into());
         },
         (Some(_), Some(_)) => {
-            eprintln!("Cannot specify both --threshold and --ncells");
-            std::process::exit(1);
+            return Err("Cannot specify both --threshold and --ncells".into());
         }
     };
 
@@ -69,14 +62,14 @@ pub fn cellselect(
 }
 
 fn select_barcodes(
-    barcodes: &FxHashMap<String, usize>,
+    barcodes: &FxHashMap<Box<str>, usize>,
     count_cutoff: &usize,
-) -> io::Result<Vec<String>> {
+) -> io::Result<Vec<Box<str>>> {
 
     // iterate over key, value entries, adding cells if count is greater than threshold
     let mut filtered_cells = Vec::new();
     for (cell_barcode, &count) in barcodes.iter() {
-        if count > *count_cutoff {
+        if count >= *count_cutoff {
             filtered_cells.push(cell_barcode.clone());
         }
     }
@@ -85,11 +78,11 @@ fn select_barcodes(
 }
 
 fn top_barcodes(
-    barcodes: &FxHashMap<String, usize>,
+    barcodes: &FxHashMap<Box<str>, usize>,
     ncells: &usize,
-) -> io::Result<Vec<String>> {
+) -> io::Result<Vec<Box<str>>> {
     // create vectors of cells and counts
-    let mut cells: Vec<String> = Vec::new();
+    let mut cells: Vec<Box<str>> = Vec::new();
     let mut counts: Vec<usize> = Vec::new();
 
     // iterate over barcode hashmap, filling in the vectors
@@ -108,7 +101,7 @@ fn top_barcodes(
 
     // Take the top n cells using the sorted indices
     let n = std::cmp::min(*ncells, cells.len());
-    let selected: Vec<String> = idx
+    let selected: Vec<Box<str>> = idx
         .into_iter()
         .take(n)
         .map(|i| cells[i].clone())
@@ -117,104 +110,48 @@ fn top_barcodes(
     Ok(selected)
 }
 
-fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<String, usize>> {
+fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<Box<str>, usize>> {
 
     let metadata = fs::metadata(&frag_file)?;
     let file_size = metadata.len() as usize;
     let estimated_lines: usize = file_size / 100;
     let estimated_cell_count: usize = (estimated_lines / 10_000).max(1000);
 
-    let mut cells: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(
+    let mut cells: FxHashMap<Box<str>, usize> = FxHashMap::with_capacity_and_hasher(
         estimated_cell_count, 
         Default::default()
     );
 
-    // Create a channel for communication between the decompression and processing threads
-    let (tx, rx) = mpsc::sync_channel(100);
-
-    // Spawn the decompression thread
-    let frag_file = frag_file.to_path_buf();
-    let decompress_handle = thread::spawn(move || {
-        // Open the fragment file
-        let file = match File::open(&frag_file) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to open fragment file: {}", e);
-                return;
-            }
-        };
-        
-        // Create buffered reader
-        let reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(file));
-        
-        // Number of lines to read in each chunk
-        const CHUNK_SIZE: usize = 10_000;
-        let mut lines = Vec::with_capacity(CHUNK_SIZE);
-        let mut total_lines = 0;
-        
-        // Read the file line by line
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    // Skip header lines
-                    if !line.starts_with('#') {
-                        lines.push(line);
-                        
-                        // When we have a full chunk, send it to the processing thread
-                        if lines.len() >= CHUNK_SIZE {
-                            total_lines += lines.len();
-                            
-                            // Report progress
-                            if total_lines % 1_000_000 == 0 {
-                                eprint!("\rProcessed {} M fragments", total_lines / 1_000_000);
-                                std::io::stderr().flush().unwrap();
-                            }
-                            
-                            // Create a new vector and send the current one
-                            let chunk_to_send = std::mem::replace(&mut lines, Vec::with_capacity(CHUNK_SIZE));
-                            if tx.send(chunk_to_send).is_err() {
-                                // Channel closed, receiver dropped
-                                break;
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Error reading line: {}", e);
-                    break;
-                }
-            }
-        }
-        
-        // Send any remaining lines
-        if !lines.is_empty() {
-            total_lines += lines.len();
-            let _ = tx.send(lines);
-        }
-        
-        eprintln!("\nFinished reading {} total fragments", total_lines);
-    });
+    // Spawn reader thread for decompression
+    let (decompress_handle, rx, pool_tx) = crate::reader::spawn_fragment_reader(frag_file);
 
     // Process chunks from the channel
-    for chunk in rx {
-        for line in chunk {
-
-            let mut field_idx = 0;
-            let mut cell_barcode = None;
-            
-            for field in line.split('\t') {
-                if field_idx == 3 {
-                    cell_barcode = Some(field);
-                    break;
-                }
-                field_idx += 1;
+    for mut chunk in rx {
+        for line in chunk.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
             }
-            
-            if let Some(barcode) = cell_barcode {
-                let barcode_string = barcode.to_string();
-                *cells.entry(barcode_string).or_insert(0) += 1;
+
+            let mut iter = line.splitn(5, |&b| b == b'\t');
+            let _ = match iter.next() { Some(b) => b, None => continue }; // chr
+            let _ = match iter.next() { Some(b) => b, None => continue }; // start
+            let _ = match iter.next() { Some(b) => b, None => continue }; // end
+            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
+
+            // Trim trailing \r
+            if barcode_bytes.ends_with(b"\r") {
+                barcode_bytes = &barcode_bytes[..barcode_bytes.len() - 1];
+            }
+
+            let barcode_str = unsafe { std::str::from_utf8_unchecked(barcode_bytes) };
+            if let Some(count) = cells.get_mut(barcode_str) {
+                *count += 1;
+            } else {
+                cells.insert(barcode_str.into(), 1);
             }
         }
+        chunk.clear();
+        let _ = pool_tx.send(chunk);
     }
 
     // Join thread to ensure it completes

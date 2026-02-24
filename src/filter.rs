@@ -18,22 +18,14 @@ pub fn run(
     Ok(())
 }
 
-fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<String>> {
-    let file = File::open(&path)?;
-    let reader = if path.as_ref().to_str()
-        .map(|s| s.ends_with(".gz"))
-        .unwrap_or(false) 
-    {
-        Box::new(BufReader::new(MultiGzDecoder::new(file))) as Box<dyn BufRead>
-    } else {
-        Box::new(BufReader::new(file)) as Box<dyn BufRead>
-    };
+fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<Box<str>>> {
+    let reader = crate::reader::open_maybe_gzipped(path.as_ref())?;
     
     let mut cell_barcodes = FxHashSet::default();
 
     for line in reader.lines() {
         let line = line?;
-        cell_barcodes.insert(line);
+        cell_barcodes.insert(line.into_boxed_str());
     }
 
     Ok(cell_barcodes)
@@ -41,7 +33,7 @@ fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<String>> {
 
 fn filter_fragments<P: AsRef<Path>>(
     fragments_path: P,
-    cell_barcodes: &FxHashSet<String>,
+    cell_barcodes: &FxHashSet<Box<str>>,
 ) -> std::io::Result<()> {
     let fragments_file = File::open(fragments_path)?;
     let mut fragments_reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(fragments_file));

@@ -4,20 +4,17 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use lexical_core::parse;
-use log::error;
 use log::info;
 use rust_lapper::{Interval, Lapper};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
-use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::thread;
 
 // https://www.encodeproject.org/data-standards/terms/
 /* The reads around a reference set of TSSs are collected to form an aggregate
@@ -95,6 +92,7 @@ pub fn tss_enrichment(
     fragments: &str,
     annotation: &str,
     annotation_is_gff: bool,
+    cells: Option<&str>,
     outfile: &str
 ) -> Result<(), Box<dyn Error>> {
     // get TSS positions from the annotation file
@@ -110,6 +108,27 @@ pub fn tss_enrichment(
 
     info!("Received output file path: {:?}", outfile);
 
+    // Load cell barcodes if provided
+    let cell_filter: Option<FxHashSet<Box<str>>> = match cells {
+        Some(cells_path) => {
+            let cell_file = Path::new(cells_path)
+                .canonicalize()
+                .expect("Can't find path to input cell file");
+            info!("Received cell file: {:?}", cell_file);
+            let reader = crate::reader::open_maybe_gzipped(&cell_file)?;
+            let mut set = FxHashSet::default();
+            for line in reader.lines() {
+                set.insert(line?.into_boxed_str());
+            }
+            info!("Loaded {} cell barcodes for filtering", set.len());
+            Some(set)
+        },
+        None => {
+            info!("No cell barcode filter provided, processing all cells");
+            None
+        }
+    };
+
     let annotation = annotation.to_path_buf();
 
     let tss_regions = if annotation_is_gff {
@@ -121,88 +140,47 @@ pub fn tss_enrichment(
     // iterate over fragments
     // count overlaps with tss regions and flanking regions
     // store in hashmap of FragmentCounts
-    let mut results_by_cell: FxHashMap<String, FragmentCounts> = FxHashMap::default();
+    let mut results_by_cell: FxHashMap<Box<str>, FragmentCounts> = FxHashMap::default();
 
-    // Create channels for communication between threads
-    let (tx, rx) = mpsc::sync_channel(100);
-
-    // Spawn thread for decompression and reading
+    // Spawn reader thread for decompression
     let frag_file = frag_file.to_path_buf();
-    let reader_handle = thread::spawn(move || {
-        let file = match File::open(&frag_file) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to open fragment file: {}", e);
-                return;
-            }
-        };
-
-        let reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(file));
-
-        // Process fragments in chunks for better performance
-        const CHUNK_SIZE: usize = 10_000;
-        let mut fragments = Vec::with_capacity(CHUNK_SIZE);
-        let mut total_fragments = 0;
-
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    // Skip header lines
-                    if !line.starts_with('#') {
-                        fragments.push(line);
-
-                        if fragments.len() >= CHUNK_SIZE {
-                            total_fragments += fragments.len();
-
-                            // Report progress
-                            if total_fragments % 1_000_000 == 0 {
-                                print!("\rProcessed {} M fragments", total_fragments / 1_000_000);
-                                std::io::stdout().flush().expect("Can't flush output");
-                            }
-
-                            // Send chunks for processing
-                            let chunk_to_send =
-                                std::mem::replace(&mut fragments, Vec::with_capacity(CHUNK_SIZE));
-                            if tx.send(chunk_to_send).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error reading fragment file: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // Send any remaining fragments
-        if !fragments.is_empty() {
-            total_fragments += fragments.len();
-            let _ = tx.send(fragments);
-        }
-
-        eprintln!("\nFinished reading {} total fragments", total_fragments);
-    });
+    let (reader_handle, rx, pool_tx) = crate::reader::spawn_fragment_reader(&frag_file);
 
     let mut current_chrom = String::new();
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
     let mut cursor = 0;
 
     // Process chunks from the channel
-    for chunk in rx {
-        for line in chunk {
-            // Parse BED entry
-            let fields = line.split('\t').collect::<SmallVec<[&str; 10]>>();
-            if fields.len() < 4 {
+    for mut chunk in rx {
+        for line in chunk.split(|&b| b == b'\n') {
+            if line.is_empty() {
                 continue;
             }
 
-            // TODO enable specifying list of cell barcodes to include
-            let cell_barcode: &str = fields[3];
-            results_by_cell
-                .entry(cell_barcode.to_string())
-                .or_insert(FragmentCounts {
+            let mut iter = line.splitn(5, |&b| b == b'\t');
+            let seqname_bytes = match iter.next() { Some(b) => b, None => continue };
+            let start_bytes = match iter.next() { Some(b) => b, None => continue };
+            let end_bytes = match iter.next() { Some(b) => b, None => continue };
+            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
+
+            // Trim trailing \r 
+            if barcode_bytes.ends_with(b"\r") {
+                barcode_bytes = &barcode_bytes[..barcode_bytes.len() - 1];
+            }
+
+            let cell_barcode = unsafe { std::str::from_utf8_unchecked(barcode_bytes) };
+
+            // Filter by cell barcodes if a filter was provided
+            if let Some(ref filter) = cell_filter {
+                if !filter.contains(cell_barcode) {
+                    continue;
+                }
+            }
+
+            let fc = if let Some(fc) = results_by_cell.get_mut(cell_barcode) {
+                fc
+            } else {
+                results_by_cell.insert(cell_barcode.into(), FragmentCounts {
                     tss_flank: 0,
                     tss_center: 0,
                     total_fragments: 0,
@@ -212,13 +190,12 @@ pub fn tss_enrichment(
                     x_fragments: 0,
                     y_fragments: 0,
                 });
-            results_by_cell
-                .get_mut(cell_barcode)
-                .unwrap()
-                .total_fragments += 1;
+                results_by_cell.get_mut(cell_barcode).unwrap()
+            };
+            fc.total_fragments += 1;
 
             // Create intervals from fragment entry
-            let seqname: &str = fields[0];
+            let seqname = unsafe { std::str::from_utf8_unchecked(seqname_bytes) };
 
             // check if chromosome changed
             // if so, update lapper
@@ -230,24 +207,19 @@ pub fn tss_enrichment(
 
             // update mito count
             if is_mito_chr(seqname) {
-                results_by_cell
-                    .get_mut(cell_barcode)
-                    .unwrap()
-                    .mitochondrial_fragments += 1;
+                fc.mitochondrial_fragments += 1;
             } else if is_chr_x(seqname) {
-                results_by_cell.get_mut(cell_barcode).unwrap().x_fragments += 1;
+                fc.x_fragments += 1;
             } else if is_chr_y(seqname) {
-                results_by_cell.get_mut(cell_barcode).unwrap().y_fragments += 1;
+                fc.y_fragments += 1;
             }
 
-            let start_str = fields[1];
-            let end_str = fields[2];
-            let startpos = match parse::<u32>(start_str.as_bytes()) {
+            let startpos = match parse::<u32>(start_bytes) {
                 Ok(num) => num,
                 Err(_) => continue,
             };
 
-            let endpos = match parse::<u32>(end_str.as_bytes()) {
+            let endpos = match parse::<u32>(end_bytes) {
                 Ok(num) => num,
                 Err(_) => continue,
             };
@@ -256,15 +228,9 @@ pub fn tss_enrichment(
 
             // record nucleosome signal information
             if fragment_width < NUCLEOSOME {
-                results_by_cell
-                    .get_mut(cell_barcode)
-                    .unwrap()
-                    .nucleosome_free += 1;
+                fc.nucleosome_free += 1;
             } else if fragment_width < (NUCLEOSOME * 2) {
-                results_by_cell
-                    .get_mut(cell_barcode)
-                    .unwrap()
-                    .mononucleosome += 1;
+                fc.mononucleosome += 1;
             }
 
             if let Some(lapper) = &current_lapper {
@@ -272,13 +238,16 @@ pub fn tss_enrichment(
                     cursor = 0;
                 }
 
+                // re-borrow fc mutably after the continue branches above
+                let fc = results_by_cell.get_mut(cell_barcode).unwrap();
+
                 // Check for overlaps at start position
                 for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
                     let val = interval.val as u32; // 0 for tss, 1 for flank
                     if val == 0 {
-                        results_by_cell.get_mut(cell_barcode).unwrap().tss_center += 1;
+                        fc.tss_center += 1;
                     } else {
-                        results_by_cell.get_mut(cell_barcode).unwrap().tss_flank += 1;
+                        fc.tss_flank += 1;
                     }
                 }
 
@@ -286,20 +255,22 @@ pub fn tss_enrichment(
                 for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
                     let val = interval.val as u32; // 0 for tss, 1 for flank
                     if val == 0 {
-                        results_by_cell.get_mut(cell_barcode).unwrap().tss_center += 1;
+                        fc.tss_center += 1;
                     } else {
-                        results_by_cell.get_mut(cell_barcode).unwrap().tss_flank += 1;
+                        fc.tss_flank += 1;
                     }
                 }
             }
         }
+        chunk.clear();
+        let _ = pool_tx.send(chunk);
     }
 
     // Wait for reader thread to complete
     reader_handle.join().expect("Reader thread panicked");
 
     // write to file
-    let _ = write_results(&results_by_cell, &outfile);
+    write_results(&results_by_cell, &outfile)?;
 
     Ok(())
 }
@@ -314,13 +285,7 @@ pub fn tss_enrichment(
 fn extract_tss_bed(
     bed_path: &Path,
 ) -> Result<FxHashMap<String, Lapper<u32, usize>>, Box<dyn std::error::Error>> {
-    let file = File::open(bed_path)?;
-    let reader: Box<dyn BufRead> =
-        if bed_path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-            Box::new(BufReader::new(MultiGzDecoder::new(file)))
-        } else {
-            Box::new(BufReader::new(file))
-        };
+    let reader = crate::reader::open_maybe_gzipped(bed_path)?;
 
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
 
@@ -351,11 +316,12 @@ fn extract_tss_bed(
                     // assume bed file is TSS base position only
                     // just take start position
 
-                    let tss_start = start - (CENTER_SIZE / 2);
+                    // Use saturating_sub to prevent u32 underflow for TSSes near chromosome start
+                    let tss_start = start.saturating_sub(CENTER_SIZE / 2);
                     let tss_end = start + (CENTER_SIZE / 2);
 
-                    let flank_upstream_start = start - TSS_WINDOW - (FLANK_SIZE / 2);
-                    let flank_upstream_end = start - TSS_WINDOW + (FLANK_SIZE / 2);
+                    let flank_upstream_start = start.saturating_sub(TSS_WINDOW + FLANK_SIZE / 2);
+                    let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE / 2);
 
                     let flank_downstream_start = start + TSS_WINDOW - (FLANK_SIZE / 2);
                     let flank_downstream_end = start + TSS_WINDOW + (FLANK_SIZE / 2);
@@ -408,8 +374,7 @@ fn extract_tss_bed(
 fn extract_tss_gff(
     gff_path: &Path,
 ) -> Result<FxHashMap<String, Lapper<u32, usize>>, Box<dyn std::error::Error>> {
-    let file: Box<dyn io::Read> = if gff_path.extension().and_then(|ext| ext.to_str()) == Some("gz")
-    {
+    let file: Box<dyn io::Read> = if crate::reader::is_gzipped(gff_path)? {
         Box::new(MultiGzDecoder::new(File::open(gff_path)?))
     } else {
         Box::new(File::open(gff_path)?)
@@ -441,11 +406,12 @@ fn extract_tss_gff(
             start = *rec.end() as u32;
         }
 
-        let tss_start = start - (CENTER_SIZE / 2);
+        // Use saturating_sub to prevent u32 underflow for TSSes near chromosome start
+        let tss_start = start.saturating_sub(CENTER_SIZE / 2);
         let tss_end = start + (CENTER_SIZE / 2);
 
-        let flank_upstream_start = start - TSS_WINDOW - (FLANK_SIZE / 2);
-        let flank_upstream_end = start - TSS_WINDOW + (FLANK_SIZE / 2);
+        let flank_upstream_start = start.saturating_sub(TSS_WINDOW + FLANK_SIZE / 2);
+        let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE / 2);
 
         let flank_downstream_start = start + TSS_WINDOW - (FLANK_SIZE / 2);
         let flank_downstream_end = start + TSS_WINDOW + (FLANK_SIZE / 2);
@@ -477,7 +443,7 @@ fn extract_tss_gff(
 
 /// Writes a TSV of fragment counts to a gzip-compressed file.
 fn write_results(
-    counts: &FxHashMap<String, FragmentCounts>,
+    counts: &FxHashMap<Box<str>, FragmentCounts>,
     output_path: &str,
 ) -> std::io::Result<()> {
     let file = File::create(output_path)?;
@@ -494,6 +460,11 @@ fn write_results(
     for (barcode, fc) in counts {
         let mut tsse: f32 = 0.0;
         let mut nucleosome_signal: f32 = 0.0;
+        let mut fraction_tss_center: f32 = 0.0;
+        let mut mito_fraction: f32 = 0.0;
+        let mut x_fraction: f32 = 0.0;
+        let mut y_fraction: f32 = 0.0;
+
         if fc.tss_flank > 0 {
             // avoid division by zero
             // if there are zero counts in flank, must be extremely low total counts
@@ -503,11 +474,12 @@ fn write_results(
         if fc.nucleosome_free > 0 {
             nucleosome_signal = fc.mononucleosome as f32 / fc.nucleosome_free as f32;
         }
-
-        let frip: f32 = fc.tss_center as f32 / fc.total_fragments as f32;
-        let mito_fraction: f32 = fc.mitochondrial_fragments as f32 / fc.total_fragments as f32;
-        let x_fraction: f32 = fc.x_fragments as f32 / fc.total_fragments as f32;
-        let y_fraction: f32 = fc.y_fragments as f32 / fc.total_fragments as f32;
+        if fc.total_fragments > 0 {
+            fraction_tss_center = fc.tss_center as f32 / fc.total_fragments as f32;
+            mito_fraction = fc.mitochondrial_fragments as f32 / fc.total_fragments as f32;
+            x_fraction = fc.x_fragments as f32 / fc.total_fragments as f32;
+            y_fraction = fc.y_fragments as f32 / fc.total_fragments as f32;
+        }
 
         writeln!(
             writer,
@@ -517,7 +489,7 @@ fn write_results(
             fc.tss_center,
             fc.total_fragments,
             format!("{:.4}", tsse),
-            format!("{:.4}", frip),
+            format!("{:.4}", fraction_tss_center),
             format!("{:.4}", nucleosome_signal),
             fc.mitochondrial_fragments,
             format!("{:.4}", mito_fraction),

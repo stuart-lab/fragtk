@@ -14,12 +14,11 @@ use std::{
 };
 use std::fmt::Write as FmtWrite;
 use rust_lapper::{Interval, Lapper};
-use flate2::read::MultiGzDecoder;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use log::error;
 use log::info;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use gzp::{
     deflate::Gzip,
     ZWriter,
@@ -64,27 +63,17 @@ pub fn f2m(
 
     // Create the directory if it does not exist
     if !output_path.exists() {
-        if let Err(e) = fs::create_dir_all(output_path) {
-            eprintln!("Failed to create output directory: {}", e);
-            std::process::exit(1);
-        }
+        fs::create_dir_all(output_path)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
     }
 
     // make sure output is a directory
-    match fs::metadata(output_path) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                info!("{:?} is a directory.", output_path);
-            } else {
-                eprintln!("Provided output is not a directory: {}", output_path.display());
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to get metadata for {:?}: {}", output_path, e);
-            std::process::exit(1);
-        }
+    let metadata = fs::metadata(output_path)
+        .map_err(|e| format!("Failed to get metadata for {:?}: {}", output_path, e))?;
+    if !metadata.is_dir() {
+        return Err(format!("Provided output is not a directory: {}", output_path.display()).into());
     }
+    info!("{:?} is a directory.", output_path);
 
     fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads)?;
     
@@ -122,26 +111,20 @@ fn fcount(
     };
     
     // create hashmap for cell barcodes
-    let cell_file_handle = File::open(cell_file)?;
-    let cellreader: Box<dyn BufRead> = if cell_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        Box::new(BufReader::new(MultiGzDecoder::new(cell_file_handle)))
-    } else {
-        Box::new(BufReader::new(cell_file_handle))
-    };
+    let cellreader = crate::reader::open_maybe_gzipped(cell_file)?;
     
-    let mut cells: FxHashMap<String, u32> = FxHashMap::default();
+    let mut cells: FxHashMap<Box<str>, u32> = FxHashMap::default();
     for (index, line) in cellreader.lines().enumerate() {
         let line = line?;
         let index_u32 = index as u32;
-        cells.insert(line, index_u32);
+        cells.insert(line.into_boxed_str(), index_u32);
     }
     
     let cell_count = cells.len();
     info!("Loaded {} cell barcodes", cell_count);
 
-    // Create channels for communication between threads
-    let (tx, rx) = mpsc::sync_channel(100);
-    let (counts_tx, counts_rx) = mpsc::sync_channel(3); // smaller buffer, this is per chromosome
+    // Create channel for writer thread communication
+    let (counts_tx, counts_rx) = mpsc::sync_channel::<(FxHashMap<(u32, u32), u16>, bool)>(3);
 
     let temp_file = NamedTempFile::new()?;
     let temp_path_clone = temp_file.path().to_str().unwrap().to_string();
@@ -153,7 +136,7 @@ fn fcount(
     let writer_handle = thread::spawn(move || -> io::Result<()> {
         let mut result = Ok(());
         while let Ok((counts, is_last)) = counts_rx.recv() {
-            match write_matrix_market(&temp_path_clone, &counts, writer_threads) {
+            match write_matrix_market(&temp_path_clone, counts, writer_threads) {
                 Ok(_) => {
                     if is_last {
                         break;
@@ -169,123 +152,83 @@ fn fcount(
         result
     });
     
-    // Spawn thread for decompression and reading
-    let frag_file = frag_file.to_path_buf();
-    let reader_handle = thread::spawn(move || {
-        let file = match File::open(&frag_file) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to open fragment file: {}", e);
-                return;
-            }
-        };
-        
-        let reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(file));
-        
-        // Process fragments in chunks for better performance
-        const CHUNK_SIZE: usize = 10_000;
-        let mut fragments = Vec::with_capacity(CHUNK_SIZE);
-        let mut total_fragments = 0;
-        
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    // Skip header lines
-                    if !line.starts_with('#') {
-                        fragments.push(line);
-                        
-                        if fragments.len() >= CHUNK_SIZE {
-                            total_fragments += fragments.len();
-                            
-                            // Report progress
-                            if total_fragments % 1_000_000 == 0 {
-                                print!("\rProcessed {} M fragments", total_fragments / 1_000_000);
-                                std::io::stdout().flush().expect("Can't flush output");
-                            }
-                            
-                            // Send chunks for processing
-                            let chunk_to_send = std::mem::replace(&mut fragments, Vec::with_capacity(CHUNK_SIZE));
-                            if tx.send(chunk_to_send).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    error!("Error reading fragment file: {}", e);
-                    break;
-                }
-            }
-        }
-        
-        // Send any remaining fragments
-        if !fragments.is_empty() {
-            total_fragments += fragments.len();
-            let _ = tx.send(fragments);
-        }
-        
-        eprintln!("\nFinished reading {} total fragments", total_fragments);
-    });
+    // Spawn reader thread for decompression
+    let (reader_handle, rx, pool_tx) = crate::reader::spawn_fragment_reader(&frag_file);
 
     let mut nonzero_counts: u64 = 0;
-    let mut past_chromosomes: Vec<String> = Vec::new();
+    let mut past_chromosomes: FxHashSet<Box<str>> = FxHashSet::default();
     let mut peak_cell_counts: FxHashMap<(u32, u32), u16> = FxHashMap::default();
     let mut current_chrom = String::new();
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
     let mut cursor = 0;
     let mut check_end: bool;
     
-    // Process chunks from the channel
-    for chunk in rx {
-        for line in chunk {            
-            // Parse BED entry
-            let fields = line.split('\t').collect::<SmallVec<[&str; 10]>>();
-            if fields.len() < 4 {
+    for mut chunk in rx {
+        for line in chunk.split(|&b| b == b'\n') {
+            if line.is_empty() {
                 continue;
             }
             
+            let mut iter = line.splitn(5, |&b| b == b'\t');
+            let seqname_bytes = match iter.next() { Some(b) => b, None => continue };
+            let start_bytes = match iter.next() { Some(b) => b, None => continue };
+            let end_bytes = match iter.next() { Some(b) => b, None => continue };
+            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
+            
+            // Trim trailing \r
+            if barcode_bytes.ends_with(b"\r") {
+                barcode_bytes = &barcode_bytes[..barcode_bytes.len() - 1];
+            }
+
+            let cell_barcode = unsafe { std::str::from_utf8_unchecked(barcode_bytes) };
+
             // Check if cell is to be included
-            let cell_barcode: &str = fields[3];
             if let Some(&cell_index) = cells.get(cell_barcode) {
                 check_end = true;
                 
                 // Create intervals from fragment entry
-                let seqname: &str = fields[0];
+                let seqname = unsafe { std::str::from_utf8_unchecked(seqname_bytes) };
                 
                 // check if chromosome changed
                 // if so: update lapper, write previous chromosome's counts to file, reset peak_cell_counts
                 if seqname != current_chrom {
-                    if past_chromosomes.contains(&seqname.to_string()) {
-                        // throw error, entries not sorted
-                        error!("Entries not sorted: {}", line);
-                        std::process::exit(1);
+                    if past_chromosomes.contains(seqname) {
+                        // return error, entries not sorted
+                        let line_str = unsafe { std::str::from_utf8_unchecked(line) };
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Fragment file is not sorted by chromosome: {}", line_str)
+                        ));
                     }
-                    info!("Writing counts for chromosome: {}", current_chrom);
-                    past_chromosomes.push(current_chrom.clone()); // remember what has been processed
+
+                    if !current_chrom.is_empty() {
+                        info!("Writing counts for chromosome: {}", current_chrom);
+                        past_chromosomes.insert(current_chrom.clone().into_boxed_str()); // remember what has been processed
+                        nonzero_counts += peak_cell_counts.len() as u64;
+
+                        // Send current counts to writer thread
+                        if !peak_cell_counts.is_empty() {
+                            let cap = peak_cell_counts.capacity();
+                            // send counts to writer thread, replace with empty hashmap but keep capacity
+                            let counts_to_send = std::mem::replace(&mut peak_cell_counts, FxHashMap::with_capacity_and_hasher(cap, Default::default()));
+                            if let Err(e) = counts_tx.send((counts_to_send, false)) {
+                                error!("Failed to send chromosome counts: {}", e);
+                                return Err(io::Error::new(io::ErrorKind::Other, e));
+                            }
+                        }
+                    }
+
                     current_chrom = seqname.to_string();
                     current_lapper = peaks.get(&current_chrom);
                     cursor = 0;
-                    nonzero_counts += peak_cell_counts.len() as u64;
-                    
-                    // Send current counts to writer thread
-                    if !peak_cell_counts.is_empty() {
-                        // send counts to writer thread, replace with empty hashmap
-                        let counts_to_send = std::mem::replace(&mut peak_cell_counts, FxHashMap::default());
-                        if let Err(e) = counts_tx.send((counts_to_send, false)) {
-                            error!("Failed to send chromosome counts: {}", e);
-                            return Err(io::Error::new(io::ErrorKind::Other, e));
-                        }
-                    }
                 }
                 
-                let start_str = fields[1];
-                let end_str = fields[2];
-                let startpos = match parse::<u32>(start_str.as_bytes()) {
+                let startpos = match parse::<u32>(start_bytes) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
                 
-                let endpos = match parse::<u32>(end_str.as_bytes()) {
+                let endpos = match parse::<u32>(end_bytes) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
@@ -338,6 +281,8 @@ fn fcount(
                 }
             }
         }
+        chunk.clear();
+        let _ = pool_tx.send(chunk);
     }
 
     // Wait for reader thread to complete
@@ -374,9 +319,8 @@ fn fcount(
     io::copy(&mut temp_reader, &mut output_writer)?;
     output_writer.flush()?;
 
-    // Clean up the temporary data file
-    info!("Removing temporary data file: {:?}", temp_file.path());
-    std::fs::remove_file(temp_file.path().to_str().unwrap())?;
+    // NamedTempFile handles cleanup on drop
+    drop(temp_file);
     
     // write cells
     info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
@@ -395,7 +339,7 @@ fn write_cells(
 ) -> io::Result<()> {
 
     // If input is gzipped, just copy the file
-    if cells.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+    if crate::reader::is_gzipped(cells)? {
         fs::copy(cells, outfile)?;
         info!("Copied gzipped cell barcodes to {:?}", outfile);
         return Ok(());
@@ -424,7 +368,7 @@ fn write_cells(
 
 fn write_matrix_market(
     file_path: &str,
-    peak_cell_counts: &FxHashMap<(u32, u32), u16>,
+    peak_cell_counts: FxHashMap<(u32, u32), u16>,
     num_threads: usize,
 ) -> io::Result<()> {
 
@@ -451,14 +395,18 @@ fn write_matrix_market(
     let mut col_buf = itoa::Buffer::new();
     let mut val_buf = itoa::Buffer::new();
 
-    for (key, value) in peak_cell_counts.iter() {
+    let mut sorted_counts: Vec<_> = peak_cell_counts.into_iter().collect();
+    // Sort by row index (peak position), then by column index (cell)
+    sorted_counts.sort_unstable_by_key(|&(k, _)| k);
+
+    for (key, value) in sorted_counts {
 
             write!(
                 &mut output,
                 "{} {} {}\n",
                 row_buf.format(key.0 + 1),
                 col_buf.format(key.1 + 1),
-                val_buf.format(*value)
+                val_buf.format(value)
             ).unwrap();
     
             entries_in_chunk += 1;
@@ -497,12 +445,7 @@ fn peak_intervals(
         .from_writer(writer);
     
     // bed file reader
-    let file = File::open(bed_file)?;
-    let reader: Box<dyn BufRead> = if bed_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        Box::new(BufReader::new(MultiGzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
+    let reader = crate::reader::open_maybe_gzipped(bed_file)?;
     
     // hashmap of peak intervals for each chromosome
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
@@ -558,7 +501,7 @@ fn peak_intervals(
 
                         let group_index = peak_group_index.entry(peakgroup.clone()).or_insert_with(|| {
                             writeln!(writer, "{}", peakgroup).expect("Failed to write");
-                            let idx: usize = current_index - skipped_lines;
+                            let idx = current_index;
                             current_index += 1;
                             idx
                         });
@@ -566,7 +509,7 @@ fn peak_intervals(
                         intervals.push(Interval { start, stop: end, val: *group_index });
                     } else {
                         intervals.push(Interval { start, stop: end, val: index - skipped_lines});
-                        writeln!(writer, "{}-{}-{}", chromosome, start, end)?;
+                        writeln!(writer, "{}:{}-{}", chromosome, start, end)?;
                     }
                     total_peaks += 1;
                 } else {

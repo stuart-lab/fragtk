@@ -15,6 +15,7 @@ mod cellselect;
 mod filter;
 mod man;
 mod qc;
+mod reader;
 
 #[derive(Parser)]
 #[command(
@@ -222,6 +223,18 @@ enum Commands {
             short,
             long,
             value_name = "FILE",
+            help = "File containing cell barcodes to include",
+            long_help = "Optional text file containing cell barcodes to include. \
+                         Only these cells will appear in the output. \
+                         If not provided, all cell barcodes in the fragment file are included. \
+                         The file may be gzip-compressed."
+        )]
+        cells: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
             help = "Path to the output file",
             long_help = "Path to the output file. The file will contain the TSS enrichment for each cell barcode, tab-separated."
         )]
@@ -261,13 +274,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         Commands::GenerateManPages { outdir } => {
             man::generate_manpages(outdir)?;
         },
-        Commands::Qc { fragments, gff, bed, outfile } => {
+        Commands::Qc { fragments, gff, bed, cells, outfile } => {
             let (annotation, annotation_is_gff) = match (gff.as_ref(), bed.as_ref()) {
                 (Some(gff_path), None) => (gff_path, true),
                 (None, Some(bed_path)) => (bed_path, false),
                 _ => unreachable!("clap ArgGroup ensures exactly one of gff or bed is present"),
             };
-            qc::tss_enrichment(fragments, annotation, annotation_is_gff, outfile)?
+            qc::tss_enrichment(fragments, annotation, annotation_is_gff, cells.as_deref(), outfile)?
         },
     }
 
