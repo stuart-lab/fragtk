@@ -2,7 +2,7 @@
 name = "fragtk"
 version = "1.7.0"
 edition = "2021"
-authors = ["Tim Stuart <stuartt@gis.a-star.edu.sg>"]
+authors = ["Tim Stuart <stuartt@a-star.edu.sg>"]
 description = "Fragment file toolkit"
 license = "MIT"
 repository = "https://github.com/stuart-lab/fragtk"
