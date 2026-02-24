@@ -26,8 +26,10 @@ use gzp::{
 };
 use smallvec::SmallVec;
 use lexical_core::parse;
-use itoa;
 use tempfile::NamedTempFile;
+use hdf5::File as H5File;
+use hdf5::types::VarLenUnicode;
+use ndarray::Array1;
 
 const MAX_COUNT: u32 = u16::MAX as u32;
 
@@ -38,7 +40,8 @@ pub fn f2m(
     outdir: &str,
     num_threads: usize,
     group: bool,
-    pic: bool
+    pic: bool,
+    h5: bool
 ) -> Result<(), Box<dyn Error>> {
 
     let frag_file = Path::new(fragments)
@@ -75,7 +78,7 @@ pub fn f2m(
     }
     info!("{:?} is a directory.", output_path);
 
-    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads)?;
+    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads, h5)?;
     
     Ok(())
 }
@@ -88,6 +91,7 @@ fn fcount(
     group: bool,
     pic: bool,
     num_threads: usize,
+    h5: bool
 ) -> io::Result<()> {
     info!(
         "Processing fragment file: {:?}, BED file: {:?}, Cell file: {:?}",
@@ -102,7 +106,9 @@ fn fcount(
     // write features
     let feature_path = output.join("features.tsv.gz");
     info!("Writing output feature file: {:?}", &feature_path);
-    let (total_peaks, peaks) = match peak_intervals(bed_file, group, &feature_path, num_threads) {
+    
+    // Provide a Some(...) path only if not generating h5, though we could write it anyway
+    let (total_peaks, peaks, features_list) = match peak_intervals(bed_file, group, if h5 { None } else { Some(&feature_path) }, num_threads) {
         Ok(trees) => trees,
         Err(e) => {
             error!("Failed to read BED file: {}", e);
@@ -114,10 +120,13 @@ fn fcount(
     let cellreader = crate::reader::open_maybe_gzipped(cell_file)?;
     
     let mut cells: FxHashMap<Box<str>, u32> = FxHashMap::default();
+    let mut barcodes_list = Vec::new();
+    
     for (index, line) in cellreader.lines().enumerate() {
         let line = line?;
         let index_u32 = index as u32;
-        cells.insert(line.into_boxed_str(), index_u32);
+        cells.insert(line.clone().into_boxed_str(), index_u32);
+        if h5 { barcodes_list.push(line); }
     }
     
     let cell_count = cells.len();
@@ -133,23 +142,40 @@ fn fcount(
     let writer_threads = num_threads;
 
     // Spawn writer thread first
-    let writer_handle = thread::spawn(move || -> io::Result<()> {
-        let mut result = Ok(());
+    let writer_handle = thread::spawn(move || -> io::Result<Option<Vec<(u32, u32, u16)>>> {
+        let mut result: io::Result<Option<Vec<(u32, u32, u16)>>> = Ok(None);
+        let mut all_h5_counts = if h5 { Some(Vec::new()) } else { None };
+        
         while let Ok((counts, is_last)) = counts_rx.recv() {
-            match write_matrix_market(&temp_path_clone, counts, writer_threads) {
-                Ok(_) => {
-                    if is_last {
+            if let Some(ref mut all) = all_h5_counts {
+                for (k, v) in counts {
+                    all.push((k.1, k.0, v)); // cell, peak, count
+                }
+            } else {
+                match write_matrix_market(&temp_path_clone, counts, writer_threads) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Error writing matrix market: {}", e);
+                        result = Err(e);
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("Error writing matrix market: {}", e);
-                    result = Err(e);
-                    break;
-                }
+            }
+            if is_last {
+                break;
             }
         }
-        result
+        
+        if let Ok(_) = result {
+            if h5 {
+                return Ok(all_h5_counts);
+            }
+        }
+        
+        match result {
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        }
     });
     
     // Spawn reader thread for decompression
@@ -297,37 +323,51 @@ fn fcount(
     }
 
     // Wait for writer thread to complete
-    let _ = writer_handle.join().expect("Writer thread panicked");
+    let writer_result = writer_handle.join().expect("Writer thread panicked")?;
 
-    // write mtx header with proper gzip compression
-    info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
-    let output_file = File::create(output.join("matrix.mtx.gz"))?;
-    let mut header = Vec::new();
-    {
-        let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
-        writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
-        writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
-        writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
-        header_writer.flush()?;
-    }
+    if h5 {
+        // Output matrix.h5
+        info!("Writing output HDF5 file: {:?}", &output.join("matrix.h5"));
+        if let Some(all_counts) = writer_result {
+            if let Some(features) = features_list {
+                write_hdf5(&output.join("matrix.h5"), all_counts, total_peaks, cells.len(), features, barcodes_list)?;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Features list missing for HDF5 output"));
+            }
+        } else {
+            return Err(io::Error::new(io::ErrorKind::Other, "Counts list missing for HDF5 output"));
+        }
+    } else {
+        // write mtx header with proper gzip compression
+        info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
+        let output_file = File::create(output.join("matrix.mtx.gz"))?;
+        let mut header = Vec::new();
+        {
+            let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
+            writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
+            writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
+            writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
+            header_writer.flush()?;
+        }
+        
+        // Write gzipped header and concatenate with gzipped counts
+        info!("Copying counts to output file");
+        let mut output_writer = BufWriter::new(output_file);
+        output_writer.write_all(&header)?;
+        let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
+        io::copy(&mut temp_reader, &mut output_writer)?;
+        output_writer.flush()?;
     
-    // Write gzipped header and concatenate with gzipped counts
-    info!("Copying counts to output file");
-    let mut output_writer = BufWriter::new(output_file);
-    output_writer.write_all(&header)?;
-    let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
-    io::copy(&mut temp_reader, &mut output_writer)?;
-    output_writer.flush()?;
+        // write cells
+        info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
+        let cell_path = output.join("barcodes.tsv.gz");
+        info!("Writing output cells file: {:?}", &cell_path);
+        write_cells(&cell_path, cell_file, num_threads)
+            .expect("Failed to write cells");
+    }
 
     // NamedTempFile handles cleanup on drop
     drop(temp_file);
-    
-    // write cells
-    info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
-    let cell_path = output.join("barcodes.tsv.gz");
-    info!("Writing output cells file: {:?}", &cell_path);
-    write_cells(&cell_path, cell_file, num_threads)
-        .expect("Failed to write cells");
 
     Ok(())
 }
@@ -432,17 +472,22 @@ fn write_matrix_market(
 fn peak_intervals(
     bed_file: &Path,
     group: bool,
-    outfile: &Path,
+    outfile: Option<&Path>,
     num_threads: usize,
-) -> io::Result<(usize, FxHashMap<String, Lapper<u32, usize>>)> {
+) -> io::Result<(usize, FxHashMap<String, Lapper<u32, usize>>, Option<Vec<String>>)> {
 
     // feature file
-    let writer = File::create(outfile)?;
-    let mut writer: ParCompress<Gzip> = ParCompressBuilder::new()
-        .compression_level(Compression::default())
-        .num_threads(num_threads)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        .from_writer(writer);
+    let mut writer = if let Some(out) = outfile {
+        let w = File::create(out)?;
+        let pw: ParCompress<Gzip> = ParCompressBuilder::new()
+            .compression_level(Compression::default())
+            .num_threads(num_threads)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .from_writer(w);
+        Some(pw)
+    } else {
+        None
+    };
     
     // bed file reader
     let reader = crate::reader::open_maybe_gzipped(bed_file)?;
@@ -452,6 +497,8 @@ fn peak_intervals(
     
     // Store peak group name and corresponding index
     let mut peak_group_index: FxHashMap<String, usize> = FxHashMap::default();
+    
+    let mut features: Option<Vec<String>> = if outfile.is_none() { Some(Vec::new()) } else { None };
     
     // track total number of peaks
     let mut total_peaks: usize = 0;
@@ -500,7 +547,12 @@ fn peak_intervals(
                         };
 
                         let group_index = peak_group_index.entry(peakgroup.clone()).or_insert_with(|| {
-                            writeln!(writer, "{}", peakgroup).expect("Failed to write");
+                            if let Some(ref mut w) = writer {
+                                writeln!(w, "{}", peakgroup).expect("Failed to write");
+                            }
+                            if let Some(ref mut f) = features {
+                                f.push(peakgroup.clone());
+                            }
                             let idx = current_index;
                             current_index += 1;
                             idx
@@ -509,7 +561,12 @@ fn peak_intervals(
                         intervals.push(Interval { start, stop: end, val: *group_index });
                     } else {
                         intervals.push(Interval { start, stop: end, val: index - skipped_lines});
-                        writeln!(writer, "{}:{}-{}", chromosome, start, end)?;
+                        if let Some(ref mut w) = writer {
+                            writeln!(w, "{}:{}-{}", chromosome, start, end)?;
+                        }
+                        if let Some(ref mut f) = features {
+                            f.push(format!("{}:{}-{}", chromosome, start, end));
+                        }
                     }
                     total_peaks += 1;
                 } else {
@@ -533,7 +590,82 @@ fn peak_intervals(
     }
 
     // Finalize the compression, converting GzpError to io::Error
-    writer.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    if let Some(mut w) = writer {
+        w.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    }
 
-    Ok((total_peaks, lapper_map))
+    Ok((total_peaks, lapper_map, features))
+}
+
+fn write_hdf5(
+    file_path: &Path,
+    mut all_counts: Vec<(u32, u32, u16)>, // cell_idx, peak_idx, count
+    total_peaks: usize,
+    total_cells: usize,
+    features: Vec<String>,
+    barcodes: Vec<String>,
+) -> io::Result<()> {
+    // Sort primarily by cell index (column), secondarily by peak position (row) for CSC format
+    all_counts.sort_unstable_by_key(|&(c, p, _)| (c, p));
+    
+    let mut data = Vec::with_capacity(all_counts.len());
+    let mut indices = Vec::with_capacity(all_counts.len());
+    let mut indptr = Vec::with_capacity(total_cells + 1);
+    
+    indptr.push(0);
+    let mut current_col = 0;
+    
+    for &(cell, peak, value) in &all_counts {
+        // Fill empty columns
+        while current_col < cell {
+            indptr.push(data.len() as u32);
+            current_col += 1;
+        }
+        
+        indices.push(peak);
+        data.push(value);
+    }
+    
+    // Fill remaining trailing columns
+    while current_col < total_cells as u32 {
+        indptr.push(data.len() as u32);
+        current_col += 1;
+    }
+    
+    let file = H5File::create(file_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let matrix_group = file.create_group("matrix").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let data_arr = Array1::from(data);
+    matrix_group.new_dataset_builder().with_data(&data_arr).create("data").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let indices_arr = Array1::from(indices);
+    matrix_group.new_dataset_builder().with_data(&indices_arr).create("indices").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let indptr_arr = Array1::from(indptr);
+    matrix_group.new_dataset_builder().with_data(&indptr_arr).create("indptr").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let shape_arr = Array1::from(vec![total_peaks as u32, total_cells as u32]);
+    matrix_group.new_dataset_builder().with_data(&shape_arr).create("shape").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    // HDF5 string conversion natively uses Variable Length Strings over `&str`
+    let barcodes_ref: Vec<VarLenUnicode> = barcodes.iter().map(|s| s.parse().unwrap()).collect();
+    let barcodes_arr = Array1::from(barcodes_ref);
+    matrix_group.new_dataset_builder().with_data(&barcodes_arr).create("barcodes").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let features_group = matrix_group.create_group("features").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let features_ref: Vec<VarLenUnicode> = features.iter().map(|s| s.parse().unwrap()).collect();
+    let features_arr = Array1::from(features_ref);
+    features_group.new_dataset_builder().with_data(&features_arr).create("id").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    features_group.new_dataset_builder().with_data(&features_arr).create("name").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let feature_type: Vec<VarLenUnicode> = vec!["Peaks".parse().unwrap(); features.len()];
+    let feature_type_arr = Array1::from(feature_type);
+    features_group.new_dataset_builder().with_data(&feature_type_arr).create("feature_type").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    let genome: Vec<VarLenUnicode> = vec!["GRCh38".parse().unwrap(); features.len()];
+    let genome_arr = Array1::from(genome);
+    features_group.new_dataset_builder().with_data(&genome_arr).create("genome").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+    Ok(())
 }

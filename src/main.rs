@@ -105,6 +105,14 @@ enum Commands {
                          regions as a single feature in the output matrix.",
             action = clap::ArgAction::SetTrue)]
         group: bool,
+
+        #[arg(
+            long,
+            help = "Output the matrix in 10x Genomics HDF5 format",
+            long_help = "Outputs matrix.h5 to the output directory instead of the standard \
+                         Matrix Market (.mtx) and TSV files.",
+            action = clap::ArgAction::SetTrue)]
+        h5: bool,
     },
 
     #[command(
@@ -262,8 +270,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group } => {
-            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic)?
+        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group, h5 } => {
+            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic, *h5)?
         },
         Commands::Count { fragments, outfile, threshold, ncells } => {
             cellselect::cellselect(fragments, outfile, threshold, ncells)?
