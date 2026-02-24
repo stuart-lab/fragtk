@@ -106,6 +106,7 @@ enum Commands {
             action = clap::ArgAction::SetTrue)]
         group: bool,
 
+        #[cfg(feature = "hdf5")]
         #[arg(
             long,
             help = "Output the matrix in 10x Genomics HDF5 format",
@@ -270,8 +271,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
+        #[cfg(feature = "hdf5")]
         Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group, h5 } => {
             f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic, *h5)?
+        },
+        #[cfg(not(feature = "hdf5"))]
+        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group } => {
+            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic)?
         },
         Commands::Count { fragments, outfile, threshold, ncells } => {
             cellselect::cellselect(fragments, outfile, threshold, ncells)?

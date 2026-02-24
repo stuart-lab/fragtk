@@ -27,8 +27,12 @@ use gzp::{
 use smallvec::SmallVec;
 use lexical_core::parse;
 use tempfile::NamedTempFile;
+
+#[cfg(feature = "hdf5")]
 use hdf5::File as H5File;
+#[cfg(feature = "hdf5")]
 use hdf5::types::VarLenUnicode;
+#[cfg(feature = "hdf5")]
 use ndarray::Array1;
 
 const MAX_COUNT: u32 = u16::MAX as u32;
@@ -41,6 +45,7 @@ pub fn f2m(
     num_threads: usize,
     group: bool,
     pic: bool,
+    #[cfg(feature = "hdf5")]
     h5: bool
 ) -> Result<(), Box<dyn Error>> {
 
@@ -78,7 +83,11 @@ pub fn f2m(
     }
     info!("{:?} is a directory.", output_path);
 
+    #[cfg(feature = "hdf5")]
     fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads, h5)?;
+
+    #[cfg(not(feature = "hdf5"))]
+    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads)?;
     
     Ok(())
 }
@@ -91,6 +100,7 @@ fn fcount(
     group: bool,
     pic: bool,
     num_threads: usize,
+    #[cfg(feature = "hdf5")]
     h5: bool
 ) -> io::Result<()> {
     info!(
@@ -108,7 +118,12 @@ fn fcount(
     info!("Writing output feature file: {:?}", &feature_path);
     
     // Provide a Some(...) path only if not generating h5, though we could write it anyway
-    let (total_peaks, peaks, features_list) = match peak_intervals(bed_file, group, if h5 { None } else { Some(&feature_path) }, num_threads) {
+    #[cfg(feature = "hdf5")]
+    let outfile_arg = if h5 { None } else { Some(feature_path.as_path()) };
+    #[cfg(not(feature = "hdf5"))]
+    let outfile_arg = Some(feature_path.as_path());
+    
+    let (total_peaks, peaks, _features_list) = match peak_intervals(bed_file, group, outfile_arg, num_threads) {
         Ok(trees) => trees,
         Err(e) => {
             error!("Failed to read BED file: {}", e);
@@ -120,12 +135,15 @@ fn fcount(
     let cellreader = crate::reader::open_maybe_gzipped(cell_file)?;
     
     let mut cells: FxHashMap<Box<str>, u32> = FxHashMap::default();
+    
+    #[cfg(feature = "hdf5")]
     let mut barcodes_list = Vec::new();
     
     for (index, line) in cellreader.lines().enumerate() {
         let line = line?;
         let index_u32 = index as u32;
         cells.insert(line.clone().into_boxed_str(), index_u32);
+        #[cfg(feature = "hdf5")]
         if h5 { barcodes_list.push(line); }
     }
     
@@ -144,12 +162,22 @@ fn fcount(
     // Spawn writer thread first
     let writer_handle = thread::spawn(move || -> io::Result<Option<Vec<(u32, u32, u16)>>> {
         let mut result: io::Result<Option<Vec<(u32, u32, u16)>>> = Ok(None);
+        
+        #[cfg(feature = "hdf5")]
         let mut all_h5_counts = if h5 { Some(Vec::new()) } else { None };
         
         while let Ok((counts, is_last)) = counts_rx.recv() {
-            if let Some(ref mut all) = all_h5_counts {
-                for (k, v) in counts {
-                    all.push((k.1, k.0, v)); // cell, peak, count
+            #[cfg(feature = "hdf5")]
+            let is_h5 = all_h5_counts.is_some();
+            #[cfg(not(feature = "hdf5"))]
+            let is_h5 = false;
+            
+            if is_h5 {
+                #[cfg(feature = "hdf5")]
+                if let Some(ref mut all) = all_h5_counts {
+                    for (k, v) in counts {
+                        all.push((k.1, k.0, v)); // cell, peak, count
+                    }
                 }
             } else {
                 match write_matrix_market(&temp_path_clone, counts, writer_threads) {
@@ -166,6 +194,7 @@ fn fcount(
             }
         }
         
+        #[cfg(feature = "hdf5")]
         if let Ok(_) = result {
             if h5 {
                 return Ok(all_h5_counts);
@@ -323,13 +352,14 @@ fn fcount(
     }
 
     // Wait for writer thread to complete
-    let writer_result = writer_handle.join().expect("Writer thread panicked")?;
+    let _writer_result = writer_handle.join().expect("Writer thread panicked")?;
 
+    #[cfg(feature = "hdf5")]
     if h5 {
         // Output matrix.h5
         info!("Writing output HDF5 file: {:?}", &output.join("matrix.h5"));
-        if let Some(all_counts) = writer_result {
-            if let Some(features) = features_list {
+        if let Some(all_counts) = _writer_result {
+            if let Some(features) = _features_list {
                 write_hdf5(&output.join("matrix.h5"), all_counts, total_peaks, cells.len(), features, barcodes_list)?;
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, "Features list missing for HDF5 output"));
@@ -362,7 +392,37 @@ fn fcount(
         info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
         let cell_path = output.join("barcodes.tsv.gz");
         info!("Writing output cells file: {:?}", &cell_path);
-        write_cells(&cell_path, cell_file, num_threads)
+        crate::f2m::write_cells(&cell_path, cell_file, num_threads)
+            .expect("Failed to write cells");
+    }
+
+    #[cfg(not(feature = "hdf5"))]
+    {
+        // write mtx header with proper gzip compression
+        info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
+        let output_file = File::create(output.join("matrix.mtx.gz"))?;
+        let mut header = Vec::new();
+        {
+            let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
+            writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
+            writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
+            writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
+            header_writer.flush()?;
+        }
+        
+        // Write gzipped header and concatenate with gzipped counts
+        info!("Copying counts to output file");
+        let mut output_writer = BufWriter::new(output_file);
+        output_writer.write_all(&header)?;
+        let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
+        io::copy(&mut temp_reader, &mut output_writer)?;
+        output_writer.flush()?;
+    
+        // write cells
+        info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
+        let cell_path = output.join("barcodes.tsv.gz");
+        info!("Writing output cells file: {:?}", &cell_path);
+        crate::f2m::write_cells(&cell_path, cell_file, num_threads)
             .expect("Failed to write cells");
     }
 
@@ -597,6 +657,7 @@ fn peak_intervals(
     Ok((total_peaks, lapper_map, features))
 }
 
+#[cfg(feature = "hdf5")]
 fn write_hdf5(
     file_path: &Path,
     mut all_counts: Vec<(u32, u32, u16)>, // cell_idx, peak_idx, count

@@ -25,8 +25,11 @@ itoa = "1.0"
 tempfile = "3.19.1"
 bio = "2.3.0"
 bio-types = "1.0.4"
-hdf5 = "0.8.1"
-ndarray = "0.15.6"
+hdf5 = { version = "0.8.1", optional = true }
+ndarray = { version = "0.15.6", optional = true }
+
+[features]
+hdf5 = ["dep:hdf5", "dep:ndarray"]
 
 [profile.release]
 panic = "abort"
