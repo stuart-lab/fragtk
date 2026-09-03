@@ -6,6 +6,7 @@ use flate2::Compression;
 use lexical_core::parse;
 use log::info;
 use rust_lapper::{Interval, Lapper};
+use crate::intervals::{seek_position, SeekCursor};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -28,11 +29,29 @@ open regions of the genome) there should be an increase in signal up to a peak i
 middle. We take the signal value at the center of the distribution after this
 normalization as our TSS enrichment metric. Used to evaluate ATAC-seq. */
 
-// TSS enrichment parameters based on ENCODE standard
-const TSS_WINDOW: u32 = 2000; // ±2000bp around TSS (total 4000bp)
-const FLANK_SIZE: u32 = 100; // 100bp at each end for normalization
-const CENTER_SIZE: u32 = 100; // 100bp at the center for score
+// TSS enrichment parameters, following the ENCODE definition quoted above: the
+// distribution extends TSS_WINDOW either side of the TSS, the background is the mean
+// depth over the FLANK_SIZE at each end of that distribution, and the score is the
+// fold change of the centre over that background.
+//
+// ENCODE takes "the signal value at the center" -- a single position. That is written
+// for a bulk aggregate profile; per single cell the centre base collects only a
+// handful of insertions and the score bottoms out at zero for real cells, so the
+// centre is averaged over CENTER_SIZE bases instead.
+const TSS_WINDOW: u32 = 2000; // distribution extends 2000bp either side (4000bp total)
+const FLANK_SIZE: u32 = 100; // 100bp at each end flank (200bp of averaged data)
+const CENTER_SIZE: u32 = 100; // central 100bp; a single position is too sparse per cell
+const PROMOTER_HALF: u32 = 1000; // promoter window is TSS +/-1000bp (2000bp total)
 const NUCLEOSOME: u32 = 147; // length of DNA wrapped around nucleosome
+
+// Total width feeding tss_flank, used with CENTER_SIZE to convert the raw counts into
+// per-base depths before taking their ratio in write_results.
+const FLANK_WIDTH: u32 = 2 * FLANK_SIZE; // upstream + downstream end flank
+
+// Floor on the flank depth (insertions per base) used to normalize the score. A cell
+// with only a handful of flank insertions otherwise divides by a near-zero background
+// and scores arbitrarily high
+const MIN_FLANK_DEPTH: f32 = 0.1;
 
 static MITO_CHROMS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 static CHRX_NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -76,6 +95,39 @@ pub fn is_chr_y(chr: &str) -> bool {
     get_chr_y().contains(chr)
 }
 
+/// Per-chromosome interval sets built from an annotation file: the TSS centre and
+/// flank windows used for the enrichment score, and a separate flattened promoter set.
+type TssRegions = (
+    FxHashMap<String, Lapper<u32, usize>>,
+    FxHashMap<String, Lapper<u32, usize>>,
+);
+
+fn build_lappers(
+    trees: FxHashMap<String, Vec<Interval<u32, usize>>>,
+) -> FxHashMap<String, Lapper<u32, usize>> {
+    trees
+        .into_iter()
+        .map(|(chr, intervals)| (chr, Lapper::new(intervals)))
+        .collect()
+}
+
+/// Build lappers with overlapping intervals merged into single spans.
+///
+/// Flattening makes each base covered only once, so an insertion can only be
+/// counted a single time even if there are overlapping TSS sites
+fn flatten_lappers(
+    trees: FxHashMap<String, Vec<Interval<u32, usize>>>,
+) -> FxHashMap<String, Lapper<u32, usize>> {
+    trees
+        .into_iter()
+        .map(|(chr, intervals)| {
+            let mut lapper = Lapper::new(intervals);
+            lapper.merge_overlaps();
+            (chr, lapper)
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct FragmentCounts {
     pub tss_flank: u32,
@@ -83,6 +135,8 @@ pub struct FragmentCounts {
     pub mononucleosome: u32,
     pub nucleosome_free: u32,
     pub total_fragments: u32,
+    pub total_insertions: u32,
+    pub promoter_insertions: u32,
     pub mitochondrial_fragments: u32,
     pub x_fragments: u32,
     pub y_fragments: u32,
@@ -131,7 +185,7 @@ pub fn tss_enrichment(
 
     let annotation = annotation.to_path_buf();
 
-    let tss_regions = if annotation_is_gff {
+    let (tss_regions, promoter_regions) = if annotation_is_gff {
         extract_tss_gff(&annotation)?
     } else {
         extract_tss_bed(&annotation)?
@@ -148,7 +202,11 @@ pub fn tss_enrichment(
 
     let mut current_chrom = String::new();
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
-    let mut cursor = 0;
+    let mut start_cursor = SeekCursor::new();
+    let mut end_cursor = SeekCursor::new();
+    let mut current_promoters: Option<&Lapper<u32, usize>> = None;
+    let mut prom_start_cursor = SeekCursor::new();
+    let mut prom_end_cursor = SeekCursor::new();
 
     // Process chunks from the channel
     for mut chunk in rx {
@@ -184,6 +242,8 @@ pub fn tss_enrichment(
                     tss_flank: 0,
                     tss_center: 0,
                     total_fragments: 0,
+                    total_insertions: 0,
+                    promoter_insertions: 0,
                     mononucleosome: 0,
                     nucleosome_free: 0,
                     mitochondrial_fragments: 0,
@@ -202,7 +262,11 @@ pub fn tss_enrichment(
             if seqname != current_chrom {
                 current_chrom = seqname.to_string();
                 current_lapper = tss_regions.get(&current_chrom);
-                cursor = 0;
+                start_cursor.reset();
+                end_cursor.reset();
+                current_promoters = promoter_regions.get(&current_chrom);
+                prom_start_cursor.reset();
+                prom_end_cursor.reset();
             }
 
             // update mito count
@@ -233,16 +297,27 @@ pub fn tss_enrichment(
                 fc.mononucleosome += 1;
             }
 
-            if let Some(lapper) = &current_lapper {
-                if lapper.intervals.len() == 1 {
-                    cursor = 0;
+            // re-borrow fc mutably after the continue branches above
+            let fc = results_by_cell.get_mut(cell_barcode).unwrap();
+
+            // each fragment contributes two Tn5 insertions, at its start and its end
+            fc.total_insertions += 2;
+
+            // Promoter regions are flattened, so each insertion matches at most once
+            if let Some(promoters) = &current_promoters {
+                for (pos, cur) in [
+                    (startpos, &mut prom_start_cursor),
+                    (endpos, &mut prom_end_cursor),
+                ] {
+                    if seek_position(promoters, pos, cur).next().is_some() {
+                        fc.promoter_insertions += 1;
+                    }
                 }
+            }
 
-                // re-borrow fc mutably after the continue branches above
-                let fc = results_by_cell.get_mut(cell_barcode).unwrap();
-
+            if let Some(lapper) = &current_lapper {
                 // Check for overlaps at start position
-                for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
+                for interval in seek_position(lapper, startpos, &mut start_cursor) {
                     let val = interval.val as u32; // 0 for tss, 1 for flank
                     if val == 0 {
                         fc.tss_center += 1;
@@ -252,7 +327,7 @@ pub fn tss_enrichment(
                 }
 
                 // Check for overlaps at end position
-                for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
+                for interval in seek_position(lapper, endpos, &mut end_cursor) {
                     let val = interval.val as u32; // 0 for tss, 1 for flank
                     if val == 0 {
                         fc.tss_center += 1;
@@ -275,19 +350,18 @@ pub fn tss_enrichment(
     Ok(())
 }
 
-/// Extract TSS regions from a BED file
+/// Extract TSS and promoter regions from a BED file of TSS positions.
 ///
-/// BED file contains TSS positions
-/// returns a hashmap of chromosome names to vectors of Interval objects
-/// each interval is a TSS region or flanking region
-/// the value of the interval determines if it is a TSS region or flanking region
-/// 0 indicates a TSS region, 1 indicates a flanking region
+/// Returns the enrichment-score intervals keyed by chromosome, where an interval value
+/// of 0 marks the centre window and 1 a flanking window, plus a separate flattened set
+/// of promoter intervals. See [`TssRegions`].
 fn extract_tss_bed(
     bed_path: &Path,
-) -> Result<FxHashMap<String, Lapper<u32, usize>>, Box<dyn std::error::Error>> {
+) -> Result<TssRegions, Box<dyn std::error::Error>> {
     let reader = crate::reader::open_maybe_gzipped(bed_path)?;
 
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
+    let mut promoter_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
 
     eprintln!("Reading TSS positions");
     for line in reader.lines() {
@@ -311,20 +385,23 @@ fn extract_tss_bed(
 
                     let intervals = chromosome_trees
                         .entry(chromosome.clone())
-                        .or_insert_with(Vec::new);
+                        .or_default();
 
                     // assume bed file is TSS base position only
                     // just take start position
 
-                    // Use saturating_sub to prevent u32 underflow for TSSes near chromosome start
+                    // Centre of the distribution: the central CENTER_SIZE bases, centred on
+                    // the TSS. Deriving tss_end from tss_start keeps the width exactly
+                    // CENTER_SIZE. saturating_sub guards TSSes near the chromosome start.
                     let tss_start = start.saturating_sub(CENTER_SIZE / 2);
-                    let tss_end = start + (CENTER_SIZE / 2);
+                    let tss_end = tss_start + CENTER_SIZE;
 
-                    let flank_upstream_start = start.saturating_sub(TSS_WINDOW + FLANK_SIZE / 2);
-                    let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE / 2);
+                    // the FLANK_SIZE at each end of the +/-TSS_WINDOW distribution
+                    let flank_upstream_start = start.saturating_sub(TSS_WINDOW);
+                    let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE);
 
-                    let flank_downstream_start = start + TSS_WINDOW - (FLANK_SIZE / 2);
-                    let flank_downstream_end = start + TSS_WINDOW + (FLANK_SIZE / 2);
+                    let flank_downstream_start = start + TSS_WINDOW - FLANK_SIZE;
+                    let flank_downstream_end = start + TSS_WINDOW;
 
                     intervals.push(Interval {
                         start: tss_start,
@@ -341,6 +418,15 @@ fn extract_tss_bed(
                         stop: flank_downstream_end,
                         val: 1,
                     });
+
+                    promoter_trees
+                        .entry(chromosome)
+                        .or_default()
+                        .push(Interval {
+                            start: start.saturating_sub(PROMOTER_HALF),
+                            stop: start + PROMOTER_HALF,
+                            val: 0,
+                        });
                 } else {
                     return Err(Box::new(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -357,23 +443,17 @@ fn extract_tss_bed(
         }
     }
 
-    let lapper_map = chromosome_trees
-        .into_iter()
-        .map(|(chr, intervals)| (chr, Lapper::new(intervals)))
-        .collect();
-
-    Ok(lapper_map)
+    Ok((build_lappers(chromosome_trees), flatten_lappers(promoter_trees)))
 }
 
-/// Extract TSS regions from a GFF file
+/// Extract TSS and promoter regions from a GFF file of gene annotations.
 ///
-/// returns a hashmap of chromosome names to vectors of Interval objects
-/// each interval is a TSS region or flanking region
-/// the value of the interval determines if it is a TSS region or flanking region
-/// 0 indicates a TSS region, 1 indicates a flanking region
+/// Returns the enrichment-score intervals keyed by chromosome, where an interval value
+/// of 0 marks the centre window and 1 a flanking window, plus a separate flattened set
+/// of promoter intervals. See [`TssRegions`].
 fn extract_tss_gff(
     gff_path: &Path,
-) -> Result<FxHashMap<String, Lapper<u32, usize>>, Box<dyn std::error::Error>> {
+) -> Result<TssRegions, Box<dyn std::error::Error>> {
     let file: Box<dyn io::Read> = if crate::reader::is_gzipped(gff_path)? {
         Box::new(MultiGzDecoder::new(File::open(gff_path)?))
     } else {
@@ -381,8 +461,9 @@ fn extract_tss_gff(
     };
     let mut reader = gff::Reader::new(file, gff::GffType::GFF3);
 
-    // hashmap of peak intervals for each chromosome
+    // hashmap of TSS intervals for each chromosome
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
+    let mut promoter_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
 
     eprintln!("Reading gene annotations");
     for record in reader.records() {
@@ -396,7 +477,7 @@ fn extract_tss_gff(
         let chromosome = rec.seqname().to_string();
         let intervals = chromosome_trees
             .entry(chromosome.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         let mut start = *rec.start() as u32;
         let strand = rec.strand().unwrap_or(Strand::Unknown);
@@ -406,15 +487,18 @@ fn extract_tss_gff(
             start = *rec.end() as u32;
         }
 
-        // Use saturating_sub to prevent u32 underflow for TSSes near chromosome start
+        // Centre of the distribution: the central CENTER_SIZE bases, centred on the TSS.
+        // Deriving tss_end from tss_start keeps the width exactly CENTER_SIZE.
+        // saturating_sub guards TSSes near the chromosome start.
         let tss_start = start.saturating_sub(CENTER_SIZE / 2);
-        let tss_end = start + (CENTER_SIZE / 2);
+        let tss_end = tss_start + CENTER_SIZE;
 
-        let flank_upstream_start = start.saturating_sub(TSS_WINDOW + FLANK_SIZE / 2);
-        let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE / 2);
+        // the FLANK_SIZE at each end of the +/-TSS_WINDOW distribution
+        let flank_upstream_start = start.saturating_sub(TSS_WINDOW);
+        let flank_upstream_end = start.saturating_sub(TSS_WINDOW - FLANK_SIZE);
 
-        let flank_downstream_start = start + TSS_WINDOW - (FLANK_SIZE / 2);
-        let flank_downstream_end = start + TSS_WINDOW + (FLANK_SIZE / 2);
+        let flank_downstream_start = start + TSS_WINDOW - FLANK_SIZE;
+        let flank_downstream_end = start + TSS_WINDOW;
 
         intervals.push(Interval {
             start: tss_start,
@@ -431,14 +515,18 @@ fn extract_tss_gff(
             stop: flank_downstream_end,
             val: 1,
         });
+
+        promoter_trees
+            .entry(chromosome)
+            .or_default()
+            .push(Interval {
+                start: start.saturating_sub(PROMOTER_HALF),
+                stop: start + PROMOTER_HALF,
+                val: 0,
+            });
     }
 
-    let lapper_map = chromosome_trees
-        .into_iter()
-        .map(|(chr, intervals)| (chr, Lapper::new(intervals)))
-        .collect();
-
-    Ok(lapper_map)
+    Ok((build_lappers(chromosome_trees), flatten_lappers(promoter_trees)))
 }
 
 /// Writes a TSV of fragment counts to a gzip-compressed file.
@@ -453,29 +541,27 @@ fn write_results(
     // Write header
     writeln!(
         writer,
-        "cell_barcode\tTSS_flank\tTSS_center\ttotal_fragments\tTSS_enrichment\tFRiP\tNucleosome_signal\tMito_fragments\tMito_fraction\tchrX_fragments\tchrX_fraction\tchrY_fragments\tchrY_fraction"
+        "cell_barcode\tTSS_flank\tTSS_center\ttotal_fragments\tTSS_enrichment\tFIP\tNucleosome_signal\tMito_fragments\tMito_fraction\tchrX_fragments\tchrX_fraction\tchrY_fragments\tchrY_fraction"
     )?;
 
     // Write records
     for (barcode, fc) in counts {
-        let mut tsse: f32 = 0.0;
         let mut nucleosome_signal: f32 = 0.0;
-        let mut fraction_tss_center: f32 = 0.0;
+        let mut fip: f32 = 0.0;
         let mut mito_fraction: f32 = 0.0;
         let mut x_fraction: f32 = 0.0;
         let mut y_fraction: f32 = 0.0;
 
-        if fc.tss_flank > 0 {
-            // avoid division by zero
-            // if there are zero counts in flank, must be extremely low total counts
-            // TSSe = 0 ok to record
-            tsse = fc.tss_center as f32 / fc.tss_flank as f32;
-        }
+        let center_depth = fc.tss_center as f32 / CENTER_SIZE as f32;
+        let flank_depth = (fc.tss_flank as f32 / FLANK_WIDTH as f32).max(MIN_FLANK_DEPTH);
+        let tsse = center_depth / flank_depth;
         if fc.nucleosome_free > 0 {
             nucleosome_signal = fc.mononucleosome as f32 / fc.nucleosome_free as f32;
         }
+        if fc.total_insertions > 0 {
+            fip = fc.promoter_insertions as f32 / fc.total_insertions as f32;
+        }
         if fc.total_fragments > 0 {
-            fraction_tss_center = fc.tss_center as f32 / fc.total_fragments as f32;
             mito_fraction = fc.mitochondrial_fragments as f32 / fc.total_fragments as f32;
             x_fraction = fc.x_fragments as f32 / fc.total_fragments as f32;
             y_fraction = fc.y_fragments as f32 / fc.total_fragments as f32;
@@ -489,7 +575,7 @@ fn write_results(
             fc.tss_center,
             fc.total_fragments,
             format!("{:.4}", tsse),
-            format!("{:.4}", fraction_tss_center),
+            format!("{:.4}", fip),
             format!("{:.4}", nucleosome_signal),
             fc.mitochondrial_fragments,
             format!("{:.4}", mito_fraction),
