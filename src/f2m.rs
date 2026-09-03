@@ -14,6 +14,7 @@ use std::{
 };
 use std::fmt::Write as FmtWrite;
 use rust_lapper::{Interval, Lapper};
+use crate::intervals::{seek_position, SeekCursor};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use log::error;
@@ -36,6 +37,25 @@ use hdf5::types::VarLenUnicode;
 use ndarray::Array1;
 
 const MAX_COUNT: u32 = u16::MAX as u32;
+
+/// Whether an `--h5` output path names the file to write rather than a directory to
+/// write `matrix.h5` into.
+///
+/// HDF5 output is a single file, so `-o counts.h5` should produce that file rather
+/// than a directory called `counts.h5` containing `matrix.h5`.
+#[cfg(feature = "hdf5")]
+fn h5_output_is_file(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    if path.is_file() {
+        return true;
+    }
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("h5") || ext.eq_ignore_ascii_case("hdf5")
+    )
+}
 
 pub fn f2m(
     fragments: &str,
@@ -69,19 +89,36 @@ pub fn f2m(
 
     let output_path = Path::new(outdir);
 
-    // Create the directory if it does not exist
-    if !output_path.exists() {
-        fs::create_dir_all(output_path)
-            .map_err(|e| format!("Failed to create output directory: {}", e))?;
-    }
+    // With --h5 the output is a single file, and may name that file rather than a
+    // directory to put it in. In that case only its parent has to exist.
+    #[cfg(feature = "hdf5")]
+    let output_is_h5_file = h5 && h5_output_is_file(output_path);
+    #[cfg(not(feature = "hdf5"))]
+    let output_is_h5_file = false;
 
-    // make sure output is a directory
-    let metadata = fs::metadata(output_path)
-        .map_err(|e| format!("Failed to get metadata for {:?}: {}", output_path, e))?;
-    if !metadata.is_dir() {
-        return Err(format!("Provided output is not a directory: {}", output_path.display()).into());
+    if output_is_h5_file {
+        info!("Writing HDF5 output to file: {:?}", output_path);
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create output directory: {}", e))?;
+            }
+        }
+    } else {
+        // Create the directory if it does not exist
+        if !output_path.exists() {
+            fs::create_dir_all(output_path)
+                .map_err(|e| format!("Failed to create output directory: {}", e))?;
+        }
+
+        // make sure output is a directory
+        let metadata = fs::metadata(output_path)
+            .map_err(|e| format!("Failed to get metadata for {:?}: {}", output_path, e))?;
+        if !metadata.is_dir() {
+            return Err(format!("Provided output is not a directory: {}", output_path.display()).into());
+        }
+        info!("{:?} is a directory.", output_path);
     }
-    info!("{:?} is a directory.", output_path);
 
     #[cfg(feature = "hdf5")]
     fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads, h5)?;
@@ -142,11 +179,26 @@ fn fcount(
     for (index, line) in cellreader.lines().enumerate() {
         let line = line?;
         let index_u32 = index as u32;
-        cells.insert(line.clone().into_boxed_str(), index_u32);
+        // Barcodes index the matrix columns, but barcodes.tsv.gz is a verbatim copy of
+        // this file. A duplicate would collapse two columns into one in the map while
+        // leaving both lines in the output, so the mtx header would declare fewer
+        // columns than the largest column index written.
+        if let Some(first) = cells.insert(line.clone().into_boxed_str(), index_u32) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Duplicate cell barcode {:?} in cell file (lines {} and {}). \
+                     Cell barcodes must be unique.",
+                    line,
+                    first + 1,
+                    index_u32 + 1
+                ),
+            ));
+        }
         #[cfg(feature = "hdf5")]
         if h5 { barcodes_list.push(line); }
     }
-    
+
     let cell_count = cells.len();
     info!("Loaded {} cell barcodes", cell_count);
 
@@ -214,8 +266,11 @@ fn fcount(
     let mut past_chromosomes: FxHashSet<Box<str>> = FxHashSet::default();
     let mut peak_cell_counts: FxHashMap<(u32, u32), u16> = FxHashMap::default();
     let mut current_chrom = String::new();
+    let mut last_start: u32 = 0;
     let mut current_lapper: Option<&Lapper<u32, usize>> = None;
-    let mut cursor = 0;
+    // fragment starts and fragment ends are separate forward-moving series
+    let mut start_cursor = SeekCursor::new();
+    let mut end_cursor = SeekCursor::new();
     let mut check_end: bool;
     
     for mut chunk in rx {
@@ -275,13 +330,29 @@ fn fcount(
 
                     current_chrom = seqname.to_string();
                     current_lapper = peaks.get(&current_chrom);
-                    cursor = 0;
+                    start_cursor.reset();
+                    end_cursor.reset();
+                    last_start = 0;
                 }
                 
                 let startpos = match parse::<u32>(start_bytes) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
+
+                // Overlaps are found with a cursor that only moves forward, so a
+                // fragment that starts before its predecessor can silently miss peaks
+                if startpos < last_start {
+                    let line_str = unsafe { std::str::from_utf8_unchecked(line) };
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Fragment file is not sorted by position ({} < {} on {}): {}",
+                            startpos, last_start, current_chrom, line_str
+                        )
+                    ));
+                }
+                last_start = startpos;
                 
                 let endpos = match parse::<u32>(end_bytes) {
                     Ok(num) => num,
@@ -289,14 +360,8 @@ fn fcount(
                 };
                 
                 if let Some(lapper) = &current_lapper {
-                    // seems to be a problem with seek if lapper has one element
-                    // set cursor to 0
-                    if lapper.intervals.len() == 1 {
-                        cursor = 0;
-                    }
-
                     // Check for overlaps at start position
-                    for interval in lapper.seek(startpos, startpos + 1, &mut cursor) {
+                    for interval in seek_position(lapper, startpos, &mut start_cursor) {
                         let peak_index = interval.val as u32;
                         let peak_end = interval.stop;
                         let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
@@ -325,7 +390,7 @@ fn fcount(
                     
                     // Check for overlaps at end position if needed
                     if check_end {
-                        for interval in lapper.seek(endpos, endpos + 1, &mut cursor) {
+                        for interval in seek_position(lapper, endpos, &mut end_cursor) {
                             let peak_index = interval.val as u32;
                             let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
                             if *count < MAX_COUNT as u16 {
@@ -356,11 +421,16 @@ fn fcount(
 
     #[cfg(feature = "hdf5")]
     if h5 {
-        // Output matrix.h5
-        info!("Writing output HDF5 file: {:?}", &output.join("matrix.h5"));
+        // Output the HDF5 file, either at the path given or as matrix.h5 inside it
+        let h5_path = if h5_output_is_file(output) {
+            output.to_path_buf()
+        } else {
+            output.join("matrix.h5")
+        };
+        info!("Writing output HDF5 file: {:?}", &h5_path);
         if let Some(all_counts) = _writer_result {
             if let Some(features) = _features_list {
-                write_hdf5(&output.join("matrix.h5"), all_counts, total_peaks, cells.len(), features, barcodes_list)?;
+                write_hdf5(&h5_path, all_counts, total_peaks, cells.len(), features, barcodes_list)?;
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, "Features list missing for HDF5 output"));
             }
