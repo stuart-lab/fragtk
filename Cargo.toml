@@ -17,9 +17,6 @@ log = "0.4.22"
 pretty_env_logger = "0.5.0"
 rust-lapper = "1.1.0"
 rustc-hash = "2.0.0"
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-2
-tikv-jemallocator = "0.6.0"
 clap_mangen = "0.2"
 smallvec = "1.15.0"
 lexical-core = "1.0.5"
@@ -27,6 +24,9 @@ itoa = "1.0"
 tempfile = "3.19.1"
 bio = "2.3.0"
 bio-types = "1.0.4"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = "0.6.0"
 
 [profile.release]
 panic = "abort"
