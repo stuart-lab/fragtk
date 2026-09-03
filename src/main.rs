@@ -11,6 +11,7 @@ use std::error::Error;
 use std::path::PathBuf;
 
 mod f2m;
+mod intervals;
 mod cellselect;
 mod filter;
 mod man;
@@ -110,8 +111,10 @@ enum Commands {
         #[arg(
             long,
             help = "Output the matrix in 10x Genomics HDF5 format",
-            long_help = "Outputs matrix.h5 to the output directory instead of the standard \
-                         Matrix Market (.mtx) and TSV files.",
+            long_help = "Outputs the matrix in 10x Genomics HDF5 format instead of the \
+                         standard Matrix Market (.mtx) and TSV files. If --outdir names a \
+                         file ending in .h5 or .hdf5 the matrix is written to that path; \
+                         otherwise it is written as matrix.h5 inside that directory.",
             action = clap::ArgAction::SetTrue)]
         h5: bool,
     },
@@ -195,7 +198,7 @@ enum Commands {
 
     #[command(
         about = "Compute scATAC-seq quality control metrics",
-        long_about = "Compute TSS enrichment, nucleosome signal, total fragments, fraction of reads in promoters (FRiP), and fraction of fragments in mito, chrX, chrY chromosomes.",
+        long_about = "Compute TSS enrichment, nucleosome signal, total fragments, fraction of insertions in promoters (FIP), and fraction of fragments in mito, chrX, chrY chromosomes.",
         group(
             ArgGroup::new("annotation")
                 .required(true)
