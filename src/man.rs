@@ -1,8 +1,8 @@
 use clap::CommandFactory;
 use clap_mangen::Man;
 use std::fs::File;
-use std::path::Path;
 use std::io::Result;
+use std::path::Path;
 
 use crate::Cli;
 
@@ -22,4 +22,4 @@ pub fn generate_manpages<P: AsRef<Path>>(outdir: P) -> Result<()> {
     }
 
     Ok(())
-} 
+}

@@ -1,38 +1,28 @@
-use std::{
-    io,
-    fs,
-    path::Path,
-    error::Error,
-    fs::File,
-    io::BufReader,
-    io::BufWriter,
-    io::BufRead,
-    io::Write,
-    sync::mpsc,
-    thread,
-    fs::OpenOptions,
-};
-use std::fmt::Write as FmtWrite;
-use rust_lapper::{Interval, Lapper};
 use crate::intervals::{seek_position, SeekCursor};
-use flate2::Compression;
 use flate2::write::GzEncoder;
-use log::error;
-use log::info;
-use rustc_hash::{FxHashMap, FxHashSet};
+use flate2::Compression;
 use gzp::{
     deflate::Gzip,
-    ZWriter,
     par::compress::{ParCompress, ParCompressBuilder},
+    ZWriter,
 };
-use smallvec::SmallVec;
 use lexical_core::parse;
+use log::error;
+use log::info;
+use rust_lapper::{Interval, Lapper};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use std::fmt::Write as FmtWrite;
+use std::{
+    error::Error, fs, fs::File, fs::OpenOptions, io, io::BufRead, io::BufReader, io::BufWriter,
+    io::Write, path::Path, sync::mpsc, thread,
+};
 use tempfile::NamedTempFile;
 
 #[cfg(feature = "hdf5")]
-use hdf5::File as H5File;
-#[cfg(feature = "hdf5")]
 use hdf5::types::VarLenUnicode;
+#[cfg(feature = "hdf5")]
+use hdf5::File as H5File;
 #[cfg(feature = "hdf5")]
 use ndarray::Array1;
 
@@ -65,10 +55,8 @@ pub fn f2m(
     num_threads: usize,
     group: bool,
     pic: bool,
-    #[cfg(feature = "hdf5")]
-    h5: bool
+    #[cfg(feature = "hdf5")] h5: bool,
 ) -> Result<(), Box<dyn Error>> {
-
     let frag_file = Path::new(fragments)
         .canonicalize()
         .expect("Can't find path to input fragment file");
@@ -115,17 +103,38 @@ pub fn f2m(
         let metadata = fs::metadata(output_path)
             .map_err(|e| format!("Failed to get metadata for {:?}: {}", output_path, e))?;
         if !metadata.is_dir() {
-            return Err(format!("Provided output is not a directory: {}", output_path.display()).into());
+            return Err(format!(
+                "Provided output is not a directory: {}",
+                output_path.display()
+            )
+            .into());
         }
         info!("{:?} is a directory.", output_path);
     }
 
     #[cfg(feature = "hdf5")]
-    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads, h5)?;
+    fcount(
+        &frag_file,
+        &bed_file,
+        &cell_file,
+        output_path,
+        group,
+        pic,
+        num_threads,
+        h5,
+    )?;
 
     #[cfg(not(feature = "hdf5"))]
-    fcount(&frag_file, &bed_file, &cell_file, output_path, group, pic, num_threads)?;
-    
+    fcount(
+        &frag_file,
+        &bed_file,
+        &cell_file,
+        output_path,
+        group,
+        pic,
+        num_threads,
+    )?;
+
     Ok(())
 }
 
@@ -137,8 +146,7 @@ fn fcount(
     group: bool,
     pic: bool,
     num_threads: usize,
-    #[cfg(feature = "hdf5")]
-    h5: bool
+    #[cfg(feature = "hdf5")] h5: bool,
 ) -> io::Result<()> {
     info!(
         "Processing fragment file: {:?}, BED file: {:?}, Cell file: {:?}",
@@ -153,29 +161,34 @@ fn fcount(
     // write features
     let feature_path = output.join("features.tsv.gz");
     info!("Writing output feature file: {:?}", &feature_path);
-    
+
     // Provide a Some(...) path only if not generating h5, though we could write it anyway
     #[cfg(feature = "hdf5")]
-    let outfile_arg = if h5 { None } else { Some(feature_path.as_path()) };
+    let outfile_arg = if h5 {
+        None
+    } else {
+        Some(feature_path.as_path())
+    };
     #[cfg(not(feature = "hdf5"))]
     let outfile_arg = Some(feature_path.as_path());
-    
-    let (total_peaks, peaks, _features_list) = match peak_intervals(bed_file, group, outfile_arg, num_threads) {
-        Ok(trees) => trees,
-        Err(e) => {
-            error!("Failed to read BED file: {}", e);
-            return Err(e);
-        }
-    };
-    
+
+    let (total_peaks, peaks, _features_list) =
+        match peak_intervals(bed_file, group, outfile_arg, num_threads) {
+            Ok(trees) => trees,
+            Err(e) => {
+                error!("Failed to read BED file: {}", e);
+                return Err(e);
+            }
+        };
+
     // create hashmap for cell barcodes
     let cellreader = crate::reader::open_maybe_gzipped(cell_file)?;
-    
+
     let mut cells: FxHashMap<Box<str>, u32> = FxHashMap::default();
-    
+
     #[cfg(feature = "hdf5")]
     let mut barcodes_list = Vec::new();
-    
+
     for (index, line) in cellreader.lines().enumerate() {
         let line = line?;
         let index_u32 = index as u32;
@@ -196,7 +209,9 @@ fn fcount(
             ));
         }
         #[cfg(feature = "hdf5")]
-        if h5 { barcodes_list.push(line); }
+        if h5 {
+            barcodes_list.push(line);
+        }
     }
 
     let cell_count = cells.len();
@@ -214,16 +229,16 @@ fn fcount(
     // Spawn writer thread first
     let writer_handle = thread::spawn(move || -> io::Result<Option<Vec<(u32, u32, u16)>>> {
         let mut result: io::Result<Option<Vec<(u32, u32, u16)>>> = Ok(None);
-        
+
         #[cfg(feature = "hdf5")]
         let mut all_h5_counts = if h5 { Some(Vec::new()) } else { None };
-        
+
         while let Ok((counts, is_last)) = counts_rx.recv() {
             #[cfg(feature = "hdf5")]
             let is_h5 = all_h5_counts.is_some();
             #[cfg(not(feature = "hdf5"))]
             let is_h5 = false;
-            
+
             if is_h5 {
                 #[cfg(feature = "hdf5")]
                 if let Some(ref mut all) = all_h5_counts {
@@ -245,20 +260,20 @@ fn fcount(
                 break;
             }
         }
-        
+
         #[cfg(feature = "hdf5")]
         if let Ok(_) = result {
             if h5 {
                 return Ok(all_h5_counts);
             }
         }
-        
+
         match result {
             Ok(_) => Ok(None),
             Err(e) => Err(e),
         }
     });
-    
+
     // Spawn reader thread for decompression
     let (reader_handle, rx, pool_tx) = crate::reader::spawn_fragment_reader(&frag_file);
 
@@ -272,19 +287,31 @@ fn fcount(
     let mut start_cursor = SeekCursor::new();
     let mut end_cursor = SeekCursor::new();
     let mut check_end: bool;
-    
+
     for mut chunk in rx {
         for line in chunk.split(|&b| b == b'\n') {
             if line.is_empty() {
                 continue;
             }
-            
+
             let mut iter = line.splitn(5, |&b| b == b'\t');
-            let seqname_bytes = match iter.next() { Some(b) => b, None => continue };
-            let start_bytes = match iter.next() { Some(b) => b, None => continue };
-            let end_bytes = match iter.next() { Some(b) => b, None => continue };
-            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
-            
+            let seqname_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let start_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let end_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let mut barcode_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+
             // Trim trailing \r
             if barcode_bytes.ends_with(b"\r") {
                 barcode_bytes = &barcode_bytes[..barcode_bytes.len() - 1];
@@ -295,10 +322,10 @@ fn fcount(
             // Check if cell is to be included
             if let Some(&cell_index) = cells.get(cell_barcode) {
                 check_end = true;
-                
+
                 // Create intervals from fragment entry
                 let seqname = unsafe { std::str::from_utf8_unchecked(seqname_bytes) };
-                
+
                 // check if chromosome changed
                 // if so: update lapper, write previous chromosome's counts to file, reset peak_cell_counts
                 if seqname != current_chrom {
@@ -307,7 +334,7 @@ fn fcount(
                         let line_str = unsafe { std::str::from_utf8_unchecked(line) };
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Fragment file is not sorted by chromosome: {}", line_str)
+                            format!("Fragment file is not sorted by chromosome: {}", line_str),
                         ));
                     }
 
@@ -320,7 +347,10 @@ fn fcount(
                         if !peak_cell_counts.is_empty() {
                             let cap = peak_cell_counts.capacity();
                             // send counts to writer thread, replace with empty hashmap but keep capacity
-                            let counts_to_send = std::mem::replace(&mut peak_cell_counts, FxHashMap::with_capacity_and_hasher(cap, Default::default()));
+                            let counts_to_send = std::mem::replace(
+                                &mut peak_cell_counts,
+                                FxHashMap::with_capacity_and_hasher(cap, Default::default()),
+                            );
                             if let Err(e) = counts_tx.send((counts_to_send, false)) {
                                 error!("Failed to send chromosome counts: {}", e);
                                 return Err(io::Error::new(io::ErrorKind::Other, e));
@@ -334,7 +364,7 @@ fn fcount(
                     end_cursor.reset();
                     last_start = 0;
                 }
-                
+
                 let startpos = match parse::<u32>(start_bytes) {
                     Ok(num) => num,
                     Err(_) => continue,
@@ -349,30 +379,32 @@ fn fcount(
                         format!(
                             "Fragment file is not sorted by position ({} < {} on {}): {}",
                             startpos, last_start, current_chrom, line_str
-                        )
+                        ),
                     ));
                 }
                 last_start = startpos;
-                
+
                 let endpos = match parse::<u32>(end_bytes) {
                     Ok(num) => num,
                     Err(_) => continue,
                 };
-                
+
                 if let Some(lapper) = &current_lapper {
                     // Check for overlaps at start position
                     for interval in seek_position(lapper, startpos, &mut start_cursor) {
                         let peak_index = interval.val as u32;
                         let peak_end = interval.stop;
-                        let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
+                        let count = peak_cell_counts
+                            .entry((peak_index, cell_index))
+                            .or_insert(0);
                         if *count < MAX_COUNT as u16 {
                             *count += 1;
                         }
-                        
+
                         if endpos < peak_end {
                             // Check if fragment end is behind peak end (it overlaps)
                             check_end = false;
-                            
+
                             // From Paired Insertion Counting paper
                             // https://www.nature.com/articles/s41592-023-02103-7
                             //
@@ -380,19 +412,23 @@ fn fcount(
                             // are both within the interval, they are counted as one (pair); if only one insertion is within
                             // the interval and the other is outside the interval, also count one (pair).
                             if !pic {
-                                let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
+                                let count = peak_cell_counts
+                                    .entry((peak_index, cell_index))
+                                    .or_insert(0);
                                 if *count < MAX_COUNT as u16 {
                                     *count += 1;
                                 }
                             }
                         }
                     }
-                    
+
                     // Check for overlaps at end position if needed
                     if check_end {
                         for interval in seek_position(lapper, endpos, &mut end_cursor) {
                             let peak_index = interval.val as u32;
-                            let count = peak_cell_counts.entry((peak_index, cell_index)).or_insert(0);
+                            let count = peak_cell_counts
+                                .entry((peak_index, cell_index))
+                                .or_insert(0);
                             if *count < MAX_COUNT as u16 {
                                 *count += 1;
                             }
@@ -430,26 +466,52 @@ fn fcount(
         info!("Writing output HDF5 file: {:?}", &h5_path);
         if let Some(all_counts) = _writer_result {
             if let Some(features) = _features_list {
-                write_hdf5(&h5_path, all_counts, total_peaks, cells.len(), features, barcodes_list)?;
+                write_hdf5(
+                    &h5_path,
+                    all_counts,
+                    total_peaks,
+                    cells.len(),
+                    features,
+                    barcodes_list,
+                )?;
             } else {
-                return Err(io::Error::new(io::ErrorKind::Other, "Features list missing for HDF5 output"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Features list missing for HDF5 output",
+                ));
             }
         } else {
-            return Err(io::Error::new(io::ErrorKind::Other, "Counts list missing for HDF5 output"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Counts list missing for HDF5 output",
+            ));
         }
     } else {
         // write mtx header with proper gzip compression
-        info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
+        info!(
+            "Writing output counts file: {:?}",
+            &output.join("matrix.mtx.gz")
+        );
         let output_file = File::create(output.join("matrix.mtx.gz"))?;
         let mut header = Vec::new();
         {
-            let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
-            writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
+            let mut header_writer =
+                BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
+            writeln!(
+                header_writer,
+                "%%MatrixMarket matrix coordinate integer general"
+            )?;
             writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
-            writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
+            writeln!(
+                header_writer,
+                "{} {} {}",
+                total_peaks,
+                cells.len(),
+                nonzero_counts
+            )?;
             header_writer.flush()?;
         }
-        
+
         // Write gzipped header and concatenate with gzipped counts
         info!("Copying counts to output file");
         let mut output_writer = BufWriter::new(output_file);
@@ -457,29 +519,44 @@ fn fcount(
         let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
         io::copy(&mut temp_reader, &mut output_writer)?;
         output_writer.flush()?;
-    
+
         // write cells
-        info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
+        info!(
+            "Writing output cells file: {:?}",
+            &output.join("barcodes.tsv.gz")
+        );
         let cell_path = output.join("barcodes.tsv.gz");
         info!("Writing output cells file: {:?}", &cell_path);
-        crate::f2m::write_cells(&cell_path, cell_file, num_threads)
-            .expect("Failed to write cells");
+        crate::f2m::write_cells(&cell_path, cell_file, num_threads).expect("Failed to write cells");
     }
 
     #[cfg(not(feature = "hdf5"))]
     {
         // write mtx header with proper gzip compression
-        info!("Writing output counts file: {:?}", &output.join("matrix.mtx.gz"));
+        info!(
+            "Writing output counts file: {:?}",
+            &output.join("matrix.mtx.gz")
+        );
         let output_file = File::create(output.join("matrix.mtx.gz"))?;
         let mut header = Vec::new();
         {
-            let mut header_writer = BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
-            writeln!(header_writer, "%%MatrixMarket matrix coordinate integer general")?;
+            let mut header_writer =
+                BufWriter::new(GzEncoder::new(&mut header, Compression::default()));
+            writeln!(
+                header_writer,
+                "%%MatrixMarket matrix coordinate integer general"
+            )?;
             writeln!(header_writer, "%metadata json: {{\"software_version\": \"fragtk-{}\", \"command\": \"fragtk matrix\"}}", env!("CARGO_PKG_VERSION"))?;
-            writeln!(header_writer, "{} {} {}", total_peaks, cells.len(), nonzero_counts)?;
+            writeln!(
+                header_writer,
+                "{} {} {}",
+                total_peaks,
+                cells.len(),
+                nonzero_counts
+            )?;
             header_writer.flush()?;
         }
-        
+
         // Write gzipped header and concatenate with gzipped counts
         info!("Copying counts to output file");
         let mut output_writer = BufWriter::new(output_file);
@@ -487,13 +564,15 @@ fn fcount(
         let mut temp_reader = BufReader::new(File::open(temp_file.path().to_str().unwrap())?);
         io::copy(&mut temp_reader, &mut output_writer)?;
         output_writer.flush()?;
-    
+
         // write cells
-        info!("Writing output cells file: {:?}", &output.join("barcodes.tsv.gz"));
+        info!(
+            "Writing output cells file: {:?}",
+            &output.join("barcodes.tsv.gz")
+        );
         let cell_path = output.join("barcodes.tsv.gz");
         info!("Writing output cells file: {:?}", &cell_path);
-        crate::f2m::write_cells(&cell_path, cell_file, num_threads)
-            .expect("Failed to write cells");
+        crate::f2m::write_cells(&cell_path, cell_file, num_threads).expect("Failed to write cells");
     }
 
     // NamedTempFile handles cleanup on drop
@@ -502,12 +581,7 @@ fn fcount(
     Ok(())
 }
 
-fn write_cells(
-    outfile: &Path,
-    cells: &Path,
-    num_threads: usize,
-) -> io::Result<()> {
-
+fn write_cells(outfile: &Path, cells: &Path, num_threads: usize) -> io::Result<()> {
     // If input is gzipped, just copy the file
     if crate::reader::is_gzipped(cells)? {
         fs::copy(cells, outfile)?;
@@ -530,9 +604,14 @@ fn write_cells(
         writeln!(writer, "{}", line?)?;
     }
 
-    writer.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    
-    info!("Successfully wrote compressed cell barcodes to {:?}", outfile);
+    writer
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    info!(
+        "Successfully wrote compressed cell barcodes to {:?}",
+        outfile
+    );
     Ok(())
 }
 
@@ -541,7 +620,6 @@ fn write_matrix_market(
     peak_cell_counts: FxHashMap<(u32, u32), u16>,
     num_threads: usize,
 ) -> io::Result<()> {
-
     // write count information only
     // header not written
 
@@ -570,21 +648,21 @@ fn write_matrix_market(
     sorted_counts.sort_unstable_by_key(|&(k, _)| k);
 
     for (key, value) in sorted_counts {
+        write!(
+            &mut output,
+            "{} {} {}\n",
+            row_buf.format(key.0 + 1),
+            col_buf.format(key.1 + 1),
+            val_buf.format(value)
+        )
+        .unwrap();
 
-            write!(
-                &mut output,
-                "{} {} {}\n",
-                row_buf.format(key.0 + 1),
-                col_buf.format(key.1 + 1),
-                val_buf.format(value)
-            ).unwrap();
-    
-            entries_in_chunk += 1;
-    
-            if entries_in_chunk >= CHUNK_SIZE {
-                encoder.write_all(output.as_bytes())?;
-                output.clear();
-                entries_in_chunk = 0;
+        entries_in_chunk += 1;
+
+        if entries_in_chunk >= CHUNK_SIZE {
+            encoder.write_all(output.as_bytes())?;
+            output.clear();
+            entries_in_chunk = 0;
         }
     }
 
@@ -594,7 +672,9 @@ fn write_matrix_market(
     }
 
     encoder.flush()?;
-    encoder.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    encoder
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     Ok(())
 }
@@ -604,8 +684,11 @@ fn peak_intervals(
     group: bool,
     outfile: Option<&Path>,
     num_threads: usize,
-) -> io::Result<(usize, FxHashMap<String, Lapper<u32, usize>>, Option<Vec<String>>)> {
-
+) -> io::Result<(
+    usize,
+    FxHashMap<String, Lapper<u32, usize>>,
+    Option<Vec<String>>,
+)> {
     // feature file
     let mut writer = if let Some(out) = outfile {
         let w = File::create(out)?;
@@ -618,18 +701,22 @@ fn peak_intervals(
     } else {
         None
     };
-    
+
     // bed file reader
     let reader = crate::reader::open_maybe_gzipped(bed_file)?;
-    
+
     // hashmap of peak intervals for each chromosome
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
-    
+
     // Store peak group name and corresponding index
     let mut peak_group_index: FxHashMap<String, usize> = FxHashMap::default();
-    
-    let mut features: Option<Vec<String>> = if outfile.is_none() { Some(Vec::new()) } else { None };
-    
+
+    let mut features: Option<Vec<String>> = if outfile.is_none() {
+        Some(Vec::new())
+    } else {
+        None
+    };
+
     // track total number of peaks
     let mut total_peaks: usize = 0;
 
@@ -640,7 +727,6 @@ fn peak_intervals(
     let mut skipped_lines: usize = 0;
 
     for (index, line) in reader.lines().enumerate() {
-
         match line {
             Ok(line) => {
                 if line.starts_with('#') {
@@ -653,44 +739,66 @@ fn peak_intervals(
                     let start: u32 = match parse::<u32>(fields[1].trim().as_bytes()) {
                         Ok(num) => num,
                         Err(_) => {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, 
-                                format!("Line {}: Failed to parse start position", index + 1)));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Line {}: Failed to parse start position", index + 1),
+                            ));
                         }
                     };
                     let end: u32 = match parse::<u32>(fields[2].trim().as_bytes()) {
                         Ok(num) => num,
                         Err(_) => {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                format!("Line {}: Failed to parse end position", index +1)));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Line {}: Failed to parse end position", index + 1),
+                            ));
                         }
                     };
 
-                    let intervals = chromosome_trees.entry(chromosome.clone()).or_insert_with(Vec::new);
+                    let intervals = chromosome_trees
+                        .entry(chromosome.clone())
+                        .or_insert_with(Vec::new);
 
                     if group && (fields.len() >= 4) {
                         let peakgroup: String = match fields[3].parse() {
                             Ok(num) => num,
                             Err(_) => {
-                                return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                    format!("Line {}: Failed to parse group information", index + 1)));
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "Line {}: Failed to parse group information",
+                                        index + 1
+                                    ),
+                                ));
                             }
                         };
 
-                        let group_index = peak_group_index.entry(peakgroup.clone()).or_insert_with(|| {
-                            if let Some(ref mut w) = writer {
-                                writeln!(w, "{}", peakgroup).expect("Failed to write");
-                            }
-                            if let Some(ref mut f) = features {
-                                f.push(peakgroup.clone());
-                            }
-                            let idx = current_index;
-                            current_index += 1;
-                            idx
-                        });
+                        let group_index =
+                            peak_group_index
+                                .entry(peakgroup.clone())
+                                .or_insert_with(|| {
+                                    if let Some(ref mut w) = writer {
+                                        writeln!(w, "{}", peakgroup).expect("Failed to write");
+                                    }
+                                    if let Some(ref mut f) = features {
+                                        f.push(peakgroup.clone());
+                                    }
+                                    let idx = current_index;
+                                    current_index += 1;
+                                    idx
+                                });
 
-                        intervals.push(Interval { start, stop: end, val: *group_index });
+                        intervals.push(Interval {
+                            start,
+                            stop: end,
+                            val: *group_index,
+                        });
                     } else {
-                        intervals.push(Interval { start, stop: end, val: index - skipped_lines});
+                        intervals.push(Interval {
+                            start,
+                            stop: end,
+                            val: index - skipped_lines,
+                        });
                         if let Some(ref mut w) = writer {
                             writeln!(w, "{}:{}-{}", chromosome, start, end)?;
                         }
@@ -700,18 +808,23 @@ fn peak_intervals(
                     }
                     total_peaks += 1;
                 } else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        format!("Line {}: Less than three fields", index + 1)));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Line {}: Less than three fields", index + 1),
+                    ));
                 }
-            },
+            }
             Err(e) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("Error reading line {}: {}", index + 1, e)));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Error reading line {}: {}", index + 1, e),
+                ));
             }
         }
     }
 
-    let lapper_map = chromosome_trees.into_iter()
+    let lapper_map = chromosome_trees
+        .into_iter()
         .map(|(chr, intervals)| (chr, Lapper::new(intervals)))
         .collect();
 
@@ -721,7 +834,8 @@ fn peak_intervals(
 
     // Finalize the compression, converting GzpError to io::Error
     if let Some(mut w) = writer {
-        w.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        w.finish()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
 
     Ok((total_peaks, lapper_map, features))
@@ -738,65 +852,105 @@ fn write_hdf5(
 ) -> io::Result<()> {
     // Sort primarily by cell index (column), secondarily by peak position (row) for CSC format
     all_counts.sort_unstable_by_key(|&(c, p, _)| (c, p));
-    
+
     let mut data = Vec::with_capacity(all_counts.len());
     let mut indices = Vec::with_capacity(all_counts.len());
     let mut indptr = Vec::with_capacity(total_cells + 1);
-    
+
     indptr.push(0);
     let mut current_col = 0;
-    
+
     for &(cell, peak, value) in &all_counts {
         // Fill empty columns
         while current_col < cell {
             indptr.push(data.len() as u32);
             current_col += 1;
         }
-        
+
         indices.push(peak);
         data.push(value);
     }
-    
+
     // Fill remaining trailing columns
     while current_col < total_cells as u32 {
         indptr.push(data.len() as u32);
         current_col += 1;
     }
-    
+
     let file = H5File::create(file_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let matrix_group = file.create_group("matrix").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    let matrix_group = file
+        .create_group("matrix")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let data_arr = Array1::from(data);
-    matrix_group.new_dataset_builder().with_data(&data_arr).create("data").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&data_arr)
+        .create("data")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let indices_arr = Array1::from(indices);
-    matrix_group.new_dataset_builder().with_data(&indices_arr).create("indices").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&indices_arr)
+        .create("indices")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let indptr_arr = Array1::from(indptr);
-    matrix_group.new_dataset_builder().with_data(&indptr_arr).create("indptr").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&indptr_arr)
+        .create("indptr")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let shape_arr = Array1::from(vec![total_peaks as u32, total_cells as u32]);
-    matrix_group.new_dataset_builder().with_data(&shape_arr).create("shape").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&shape_arr)
+        .create("shape")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     // HDF5 string conversion natively uses Variable Length Strings over `&str`
     let barcodes_ref: Vec<VarLenUnicode> = barcodes.iter().map(|s| s.parse().unwrap()).collect();
     let barcodes_arr = Array1::from(barcodes_ref);
-    matrix_group.new_dataset_builder().with_data(&barcodes_arr).create("barcodes").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
-    let features_group = matrix_group.create_group("features").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&barcodes_arr)
+        .create("barcodes")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let features_group = matrix_group
+        .create_group("features")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let features_ref: Vec<VarLenUnicode> = features.iter().map(|s| s.parse().unwrap()).collect();
     let features_arr = Array1::from(features_ref);
-    features_group.new_dataset_builder().with_data(&features_arr).create("id").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    features_group.new_dataset_builder().with_data(&features_arr).create("name").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    features_group
+        .new_dataset_builder()
+        .with_data(&features_arr)
+        .create("id")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    features_group
+        .new_dataset_builder()
+        .with_data(&features_arr)
+        .create("name")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let feature_type: Vec<VarLenUnicode> = vec!["Peaks".parse().unwrap(); features.len()];
     let feature_type_arr = Array1::from(feature_type);
-    features_group.new_dataset_builder().with_data(&feature_type_arr).create("feature_type").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    features_group
+        .new_dataset_builder()
+        .with_data(&feature_type_arr)
+        .create("feature_type")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let genome: Vec<VarLenUnicode> = vec!["GRCh38".parse().unwrap(); features.len()];
     let genome_arr = Array1::from(genome);
-    features_group.new_dataset_builder().with_data(&genome_arr).create("genome").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+    features_group
+        .new_dataset_builder()
+        .with_data(&genome_arr)
+        .create("genome")
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     Ok(())
 }

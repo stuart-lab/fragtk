@@ -1,14 +1,11 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write, BufWriter};
-use std::path::Path;
 use flate2::read::MultiGzDecoder;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
 
-pub fn run(
-    fragments: &str,
-    cells: &str
-) -> std::io::Result<()> {
+pub fn run(fragments: &str, cells: &str) -> std::io::Result<()> {
     // Load the cell barcodes into a FxHashSet for fast lookups
     let cell_barcodes = load_cells(cells)?;
 
@@ -20,7 +17,7 @@ pub fn run(
 
 fn load_cells<P: AsRef<Path>>(path: P) -> std::io::Result<FxHashSet<Box<str>>> {
     let reader = crate::reader::open_maybe_gzipped(path.as_ref())?;
-    
+
     let mut cell_barcodes = FxHashSet::default();
 
     for line in reader.lines() {
@@ -36,7 +33,8 @@ fn filter_fragments<P: AsRef<Path>>(
     cell_barcodes: &FxHashSet<Box<str>>,
 ) -> std::io::Result<()> {
     let fragments_file = File::open(fragments_path)?;
-    let mut fragments_reader = BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(fragments_file));
+    let mut fragments_reader =
+        BufReader::with_capacity(4 * 1024 * 1024, MultiGzDecoder::new(fragments_file));
 
     let stdout = std::io::stdout();
     let mut output_writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
@@ -69,7 +67,7 @@ fn filter_fragments<P: AsRef<Path>>(
                     continue;
                 }
 
-                let barcode_str = fields[3]; 
+                let barcode_str = fields[3];
                 if cell_barcodes.contains(barcode_str) {
                     output_buffer.extend_from_slice(buffer.as_bytes());
                     output_buffer.push(b'\n');
@@ -83,8 +81,11 @@ fn filter_fragments<P: AsRef<Path>>(
 
                 line_count += 1;
                 if line_count % 1_000_000 == 0 {
-                    eprint!("\rProcessed {} M lines, matched {} M fragments", 
-                           line_count / 1_000_000, matching_count / 1_000_000);
+                    eprint!(
+                        "\rProcessed {} M lines, matched {} M fragments",
+                        line_count / 1_000_000,
+                        matching_count / 1_000_000
+                    );
                     std::io::stderr().flush().expect("Can't flush stderr");
                 }
             }
@@ -96,12 +97,14 @@ fn filter_fragments<P: AsRef<Path>>(
     if !output_buffer.is_empty() {
         output_writer.write_all(&output_buffer)?;
     }
-    
+
     // Explicitly flush the writer
     output_writer.flush()?;
-    
-    eprintln!("\nTotal: processed {} fragments, matched {} fragments", 
-             line_count, matching_count);
+
+    eprintln!(
+        "\nTotal: processed {} fragments, matched {} fragments",
+        line_count, matching_count
+    );
 
     Ok(())
 }

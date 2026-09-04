@@ -1,3 +1,4 @@
+use crate::intervals::{seek_position, SeekCursor};
 use bio::io::gff;
 use bio_types::strand::Strand;
 use flate2::read::MultiGzDecoder;
@@ -6,7 +7,6 @@ use flate2::Compression;
 use lexical_core::parse;
 use log::info;
 use rust_lapper::{Interval, Lapper};
-use crate::intervals::{seek_position, SeekCursor};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -147,7 +147,7 @@ pub fn tss_enrichment(
     annotation: &str,
     annotation_is_gff: bool,
     cells: Option<&str>,
-    outfile: &str
+    outfile: &str,
 ) -> Result<(), Box<dyn Error>> {
     // get TSS positions from the annotation file
     let annotation = Path::new(annotation)
@@ -176,7 +176,7 @@ pub fn tss_enrichment(
             }
             info!("Loaded {} cell barcodes for filtering", set.len());
             Some(set)
-        },
+        }
         None => {
             info!("No cell barcode filter provided, processing all cells");
             None
@@ -216,12 +216,24 @@ pub fn tss_enrichment(
             }
 
             let mut iter = line.splitn(5, |&b| b == b'\t');
-            let seqname_bytes = match iter.next() { Some(b) => b, None => continue };
-            let start_bytes = match iter.next() { Some(b) => b, None => continue };
-            let end_bytes = match iter.next() { Some(b) => b, None => continue };
-            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
+            let seqname_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let start_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let end_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
+            let mut barcode_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
 
-            // Trim trailing \r 
+            // Trim trailing \r
             if barcode_bytes.ends_with(b"\r") {
                 barcode_bytes = &barcode_bytes[..barcode_bytes.len() - 1];
             }
@@ -238,18 +250,21 @@ pub fn tss_enrichment(
             let fc = if let Some(fc) = results_by_cell.get_mut(cell_barcode) {
                 fc
             } else {
-                results_by_cell.insert(cell_barcode.into(), FragmentCounts {
-                    tss_flank: 0,
-                    tss_center: 0,
-                    total_fragments: 0,
-                    total_insertions: 0,
-                    promoter_insertions: 0,
-                    mononucleosome: 0,
-                    nucleosome_free: 0,
-                    mitochondrial_fragments: 0,
-                    x_fragments: 0,
-                    y_fragments: 0,
-                });
+                results_by_cell.insert(
+                    cell_barcode.into(),
+                    FragmentCounts {
+                        tss_flank: 0,
+                        tss_center: 0,
+                        total_fragments: 0,
+                        total_insertions: 0,
+                        promoter_insertions: 0,
+                        mononucleosome: 0,
+                        nucleosome_free: 0,
+                        mitochondrial_fragments: 0,
+                        x_fragments: 0,
+                        y_fragments: 0,
+                    },
+                );
                 results_by_cell.get_mut(cell_barcode).unwrap()
             };
             fc.total_fragments += 1;
@@ -355,9 +370,7 @@ pub fn tss_enrichment(
 /// Returns the enrichment-score intervals keyed by chromosome, where an interval value
 /// of 0 marks the centre window and 1 a flanking window, plus a separate flattened set
 /// of promoter intervals. See [`TssRegions`].
-fn extract_tss_bed(
-    bed_path: &Path,
-) -> Result<TssRegions, Box<dyn std::error::Error>> {
+fn extract_tss_bed(bed_path: &Path) -> Result<TssRegions, Box<dyn std::error::Error>> {
     let reader = crate::reader::open_maybe_gzipped(bed_path)?;
 
     let mut chromosome_trees: FxHashMap<String, Vec<Interval<u32, usize>>> = FxHashMap::default();
@@ -383,9 +396,7 @@ fn extract_tss_bed(
                         }
                     };
 
-                    let intervals = chromosome_trees
-                        .entry(chromosome.clone())
-                        .or_default();
+                    let intervals = chromosome_trees.entry(chromosome.clone()).or_default();
 
                     // assume bed file is TSS base position only
                     // just take start position
@@ -430,20 +441,23 @@ fn extract_tss_bed(
                 } else {
                     return Err(Box::new(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Less than three fields"
+                        "Less than three fields",
                     )));
                 }
             }
             Err(_) => {
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Error reading line"
+                    "Error reading line",
                 )));
             }
         }
     }
 
-    Ok((build_lappers(chromosome_trees), flatten_lappers(promoter_trees)))
+    Ok((
+        build_lappers(chromosome_trees),
+        flatten_lappers(promoter_trees),
+    ))
 }
 
 /// Extract TSS and promoter regions from a GFF file of gene annotations.
@@ -451,9 +465,7 @@ fn extract_tss_bed(
 /// Returns the enrichment-score intervals keyed by chromosome, where an interval value
 /// of 0 marks the centre window and 1 a flanking window, plus a separate flattened set
 /// of promoter intervals. See [`TssRegions`].
-fn extract_tss_gff(
-    gff_path: &Path,
-) -> Result<TssRegions, Box<dyn std::error::Error>> {
+fn extract_tss_gff(gff_path: &Path) -> Result<TssRegions, Box<dyn std::error::Error>> {
     let file: Box<dyn io::Read> = if crate::reader::is_gzipped(gff_path)? {
         Box::new(MultiGzDecoder::new(File::open(gff_path)?))
     } else {
@@ -475,9 +487,7 @@ fn extract_tss_gff(
         }
 
         let chromosome = rec.seqname().to_string();
-        let intervals = chromosome_trees
-            .entry(chromosome.clone())
-            .or_default();
+        let intervals = chromosome_trees.entry(chromosome.clone()).or_default();
 
         let mut start = *rec.start() as u32;
         let strand = rec.strand().unwrap_or(Strand::Unknown);
@@ -526,7 +536,10 @@ fn extract_tss_gff(
             });
     }
 
-    Ok((build_lappers(chromosome_trees), flatten_lappers(promoter_trees)))
+    Ok((
+        build_lappers(chromosome_trees),
+        flatten_lappers(promoter_trees),
+    ))
 }
 
 /// Writes a TSV of fragment counts to a gzip-compressed file.

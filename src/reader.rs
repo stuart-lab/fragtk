@@ -1,10 +1,10 @@
+use flate2::read::MultiGzDecoder;
+use log::error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use flate2::read::MultiGzDecoder;
-use log::error;
 
 /// Detect whether a file is gzip-compressed by reading the magic bytes (0x1f, 0x8b).
 pub fn is_gzipped(path: &Path) -> io::Result<bool> {
@@ -33,7 +33,11 @@ pub fn open_maybe_gzipped(path: &Path) -> io::Result<Box<dyn BufRead>> {
 /// them over a sync channel. Returns the join handle and receiver.
 pub fn spawn_fragment_reader(
     frag_file: &Path,
-) -> (thread::JoinHandle<()>, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+) -> (
+    thread::JoinHandle<()>,
+    mpsc::Receiver<Vec<u8>>,
+    mpsc::Sender<Vec<u8>>,
+) {
     let (tx, rx) = mpsc::sync_channel(100);
     let (pool_tx, pool_rx) = mpsc::channel();
     let frag_file = frag_file.to_path_buf();
@@ -48,7 +52,9 @@ pub fn spawn_fragment_reader(
         };
 
         const CHUNK_LINES: usize = 10_000;
-        let mut buffer = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK_LINES * 100));
+        let mut buffer = pool_rx
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(CHUNK_LINES * 100));
         let mut total_fragments = 0;
         let mut line_count = 0;
 
@@ -72,7 +78,9 @@ pub fn spawn_fragment_reader(
                             std::io::stderr().flush().expect("Can't flush output");
                         }
 
-                        let mut chunk_to_send = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK_LINES * 100));
+                        let mut chunk_to_send = pool_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(CHUNK_LINES * 100));
                         chunk_to_send.clear();
                         std::mem::swap(&mut buffer, &mut chunk_to_send);
 

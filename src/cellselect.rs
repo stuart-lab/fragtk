@@ -1,19 +1,18 @@
-use std::io;
-use std::error::Error;
-use std::path::Path;
-use std::fs::File;
-use std::io::Write;
-use rustc_hash::FxHashMap;
 use log::info;
+use rustc_hash::FxHashMap;
+use std::error::Error;
 use std::fs;
+use std::fs::File;
+use std::io;
+use std::io::Write;
+use std::path::Path;
 
 pub fn cellselect(
     fragments: &str,
     outfile: &str,
     threshold: &Option<usize>,
-    ncells: &Option<usize>
+    ncells: &Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
-
     let frag_file = Path::new(fragments)
         .canonicalize()
         .expect("Can't find path to input fragment file");
@@ -25,13 +24,13 @@ pub fn cellselect(
     match (threshold, ncells) {
         (Some(t), None) => {
             info!("Cell count cutoff: {:?}", t);
-        },
+        }
         (None, Some(n)) => {
             info!("Cell number cutoff: {:?}", n);
-        },
+        }
         (None, None) => {
             return Err("Either --threshold or --ncells must be specified".into());
-        },
+        }
         (Some(_), Some(_)) => {
             return Err("Cannot specify both --threshold and --ncells".into());
         }
@@ -65,7 +64,6 @@ fn select_barcodes(
     barcodes: &FxHashMap<Box<str>, usize>,
     count_cutoff: &usize,
 ) -> io::Result<Vec<Box<str>>> {
-
     // iterate over key, value entries, adding cells if count is greater than threshold
     let mut filtered_cells = Vec::new();
     for (cell_barcode, &count) in barcodes.iter() {
@@ -96,31 +94,28 @@ fn top_barcodes(
     idx.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]));
 
     if cells.len() < *ncells {
-        eprintln!("Warning: Only {} cells available, fewer than requested {}", cells.len(), ncells);
+        eprintln!(
+            "Warning: Only {} cells available, fewer than requested {}",
+            cells.len(),
+            ncells
+        );
     }
 
     // Take the top n cells using the sorted indices
     let n = std::cmp::min(*ncells, cells.len());
-    let selected: Vec<Box<str>> = idx
-        .into_iter()
-        .take(n)
-        .map(|i| cells[i].clone())
-        .collect();
+    let selected: Vec<Box<str>> = idx.into_iter().take(n).map(|i| cells[i].clone()).collect();
 
     Ok(selected)
 }
 
 fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<Box<str>, usize>> {
-
     let metadata = fs::metadata(&frag_file)?;
     let file_size = metadata.len() as usize;
     let estimated_lines: usize = file_size / 100;
     let estimated_cell_count: usize = (estimated_lines / 10_000).max(1000);
 
-    let mut cells: FxHashMap<Box<str>, usize> = FxHashMap::with_capacity_and_hasher(
-        estimated_cell_count, 
-        Default::default()
-    );
+    let mut cells: FxHashMap<Box<str>, usize> =
+        FxHashMap::with_capacity_and_hasher(estimated_cell_count, Default::default());
 
     // Spawn reader thread for decompression
     let (decompress_handle, rx, pool_tx) = crate::reader::spawn_fragment_reader(frag_file);
@@ -133,10 +128,22 @@ fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<Box<str>, usize>> {
             }
 
             let mut iter = line.splitn(5, |&b| b == b'\t');
-            let _ = match iter.next() { Some(b) => b, None => continue }; // chr
-            let _ = match iter.next() { Some(b) => b, None => continue }; // start
-            let _ = match iter.next() { Some(b) => b, None => continue }; // end
-            let mut barcode_bytes = match iter.next() { Some(b) => b, None => continue };
+            let _ = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            }; // chr
+            let _ = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            }; // start
+            let _ = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            }; // end
+            let mut barcode_bytes = match iter.next() {
+                Some(b) => b,
+                None => continue,
+            };
 
             // Trim trailing \r
             if barcode_bytes.ends_with(b"\r") {
@@ -155,7 +162,9 @@ fn count_barcodes(frag_file: &Path) -> io::Result<FxHashMap<Box<str>, usize>> {
     }
 
     // Join thread to ensure it completes
-    decompress_handle.join().expect("Failed to join decompression thread");
+    decompress_handle
+        .join()
+        .expect("Failed to join decompression thread");
     eprintln!("Found {} unique cell barcodes", cells.len());
     Ok(cells)
 }

@@ -6,14 +6,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: std::alloc::System = std::alloc::System;
 
-use clap::{Parser, Subcommand, ArgGroup};
+use clap::{ArgGroup, Parser, Subcommand};
 use std::error::Error;
 use std::path::PathBuf;
 
-mod f2m;
-mod intervals;
 mod cellselect;
+mod f2m;
 mod filter;
+mod intervals;
 mod man;
 mod qc;
 mod reader;
@@ -38,7 +38,7 @@ enum Commands {
     )]
     Matrix {
         #[arg(
-            short, 
+            short,
             long,
             value_name = "FILE",
             help = "Path to the fragment file",
@@ -125,8 +125,8 @@ enum Commands {
     )]
     Count {
         #[arg(
-            short, 
-            long, 
+            short,
+            long,
             value_name = "FILE",
             help = "Path to the fragment file",
             long_help = "Path to the fragment file. The file should be gzipped and contain \
@@ -135,17 +135,17 @@ enum Commands {
         fragments: String,
 
         #[arg(
-            short, 
-            long, 
-            value_name = "FILE", 
+            short,
+            long,
+            value_name = "FILE",
             help = "Name of output file",
             long_help = "Name of output file. The file will contain each cell barcode and its total fragment count, tab-separated."
         )]
         outfile: String,
 
         #[arg(
-            short, 
-            long, 
+            short,
+            long,
             value_name = "NUMBER",
             help = "Minimum number of fragments for a cell to be included",
             long_help = "Sets the minimum number of fragments a cell must have to be included in the output.\
@@ -156,8 +156,8 @@ enum Commands {
         threshold: Option<usize>,
 
         #[arg(
-            short, 
-            long, 
+            short,
+            long,
             value_name = "NUMBER",
             help = "Number of top cells to select",
             long_help = "Select this many cells with the highest fragment counts. Cannot be used together with --threshold.",
@@ -175,7 +175,7 @@ enum Commands {
     )]
     Filter {
         #[arg(
-            short, 
+            short,
             long,
             value_name = "FILE",
             help = "Path to the fragment file",
@@ -185,7 +185,7 @@ enum Commands {
         fragments: String,
 
         #[arg(
-            short, 
+            short,
             long,
             value_name = "FILE",
             help = "File containing cell barcodes to include",
@@ -206,7 +206,7 @@ enum Commands {
     ))]
     Qc {
         #[arg(
-            short, 
+            short,
             long,
             value_name = "FILE",
             help = "Path to the fragment file",
@@ -219,7 +219,7 @@ enum Commands {
             short,
             long,
             value_name = "FILE",
-            help = "Path to a GFF file containing gene annotations. Supply either a GFF file or BED file, not both.",
+            help = "Path to a GFF file containing gene annotations. Supply either a GFF file or BED file, not both."
         )]
         gff: Option<String>,
 
@@ -227,7 +227,7 @@ enum Commands {
             short,
             long,
             value_name = "FILE",
-            help = "Path to a BED file containing TSS positions. Supply either a GFF file or BED file, not both.",
+            help = "Path to a BED file containing TSS positions. Supply either a GFF file or BED file, not both."
         )]
         bed: Option<String>,
 
@@ -259,11 +259,7 @@ enum Commands {
         hide = true  // Hide from normal help output
     )]
     GenerateManPages {
-        #[arg(
-            short, 
-            long,
-            help = "Output directory for man pages"
-        )]
+        #[arg(short, long, help = "Output directory for man pages")]
         outdir: PathBuf,
     },
 }
@@ -275,30 +271,56 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match &cli.command {
         #[cfg(feature = "hdf5")]
-        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group, h5 } => {
-            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic, *h5)?
-        },
+        Commands::Matrix {
+            fragments,
+            bed,
+            cells,
+            outdir,
+            threads,
+            pic,
+            group,
+            h5,
+        } => f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic, *h5)?,
         #[cfg(not(feature = "hdf5"))]
-        Commands::Matrix { fragments, bed, cells, outdir, threads, pic, group } => {
-            f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic)?
-        },
-        Commands::Count { fragments, outfile, threshold, ncells } => {
-            cellselect::cellselect(fragments, outfile, threshold, ncells)?
-        },
-        Commands::Filter { fragments, cells } => {
-            filter::run(fragments, cells)?
-        },
+        Commands::Matrix {
+            fragments,
+            bed,
+            cells,
+            outdir,
+            threads,
+            pic,
+            group,
+        } => f2m::f2m(fragments, bed, cells, outdir, *threads, *group, *pic)?,
+        Commands::Count {
+            fragments,
+            outfile,
+            threshold,
+            ncells,
+        } => cellselect::cellselect(fragments, outfile, threshold, ncells)?,
+        Commands::Filter { fragments, cells } => filter::run(fragments, cells)?,
         Commands::GenerateManPages { outdir } => {
             man::generate_manpages(outdir)?;
-        },
-        Commands::Qc { fragments, gff, bed, cells, outfile } => {
+        }
+        Commands::Qc {
+            fragments,
+            gff,
+            bed,
+            cells,
+            outfile,
+        } => {
             let (annotation, annotation_is_gff) = match (gff.as_ref(), bed.as_ref()) {
                 (Some(gff_path), None) => (gff_path, true),
                 (None, Some(bed_path)) => (bed_path, false),
                 _ => unreachable!("clap ArgGroup ensures exactly one of gff or bed is present"),
             };
-            qc::tss_enrichment(fragments, annotation, annotation_is_gff, cells.as_deref(), outfile)?
-        },
+            qc::tss_enrichment(
+                fragments,
+                annotation,
+                annotation_is_gff,
+                cells.as_deref(),
+                outfile,
+            )?
+        }
     }
 
     Ok(())
