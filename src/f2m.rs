@@ -286,7 +286,6 @@ fn fcount(
     // fragment starts and fragment ends are separate forward-moving series
     let mut start_cursor = SeekCursor::new();
     let mut end_cursor = SeekCursor::new();
-    let mut check_end: bool;
 
     for mut chunk in rx {
         for line in chunk.split(|&b| b == b'\n') {
@@ -321,8 +320,6 @@ fn fcount(
 
             // Check if cell is to be included
             if let Some(&cell_index) = cells.get(cell_barcode) {
-                check_end = true;
-
                 // Create intervals from fragment entry
                 let seqname = unsafe { std::str::from_utf8_unchecked(seqname_bytes) };
 
@@ -390,50 +387,16 @@ fn fcount(
                 };
 
                 if let Some(lapper) = &current_lapper {
-                    // Check for overlaps at start position
-                    for interval in seek_position(lapper, startpos, &mut start_cursor) {
-                        let peak_index = interval.val as u32;
-                        let peak_end = interval.stop;
-                        let count = peak_cell_counts
-                            .entry((peak_index, cell_index))
-                            .or_insert(0);
-                        if *count < MAX_COUNT as u16 {
-                            *count += 1;
-                        }
-
-                        if endpos < peak_end {
-                            // Check if fragment end is behind peak end (it overlaps)
-                            check_end = false;
-
-                            // From Paired Insertion Counting paper
-                            // https://www.nature.com/articles/s41592-023-02103-7
-                            //
-                            // In PIC, for a given chromosome interval, if the pair of insertions of an ATAC-seq fragment
-                            // are both within the interval, they are counted as one (pair); if only one insertion is within
-                            // the interval and the other is outside the interval, also count one (pair).
-                            if !pic {
-                                let count = peak_cell_counts
-                                    .entry((peak_index, cell_index))
-                                    .or_insert(0);
-                                if *count < MAX_COUNT as u16 {
-                                    *count += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    // Check for overlaps at end position if needed
-                    if check_end {
-                        for interval in seek_position(lapper, endpos, &mut end_cursor) {
-                            let peak_index = interval.val as u32;
-                            let count = peak_cell_counts
-                                .entry((peak_index, cell_index))
-                                .or_insert(0);
-                            if *count < MAX_COUNT as u16 {
-                                *count += 1;
-                            }
-                        }
-                    }
+                    count_fragment(
+                        lapper,
+                        startpos,
+                        endpos,
+                        cell_index,
+                        pic,
+                        &mut start_cursor,
+                        &mut end_cursor,
+                        &mut peak_cell_counts,
+                    );
                 }
             }
         }
@@ -579,6 +542,56 @@ fn fcount(
     drop(temp_file);
 
     Ok(())
+}
+
+/// Add `increment` to the count for a region and cell, saturating at `MAX_COUNT`.
+#[inline]
+fn add_count(
+    counts: &mut FxHashMap<(u32, u32), u16>,
+    peak_index: u32,
+    cell_index: u32,
+    increment: u32,
+) {
+    let count = counts.entry((peak_index, cell_index)).or_insert(0);
+    *count = (*count as u32 + increment).min(MAX_COUNT) as u16;
+}
+
+/// Count the two Tn5 insertions of one fragment into the regions that contain them.
+///
+/// Without PIC each insertion counts once per region containing it, so a region
+/// holding both insertions gets 2. With PIC (Miao & Kim 2023,
+/// https://www.nature.com/articles/s41592-023-02103-7) a fragment counts once per
+/// region holding either or both of its insertions.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn count_fragment(
+    lapper: &Lapper<u32, usize>,
+    startpos: u32,
+    endpos: u32,
+    cell_index: u32,
+    pic: bool,
+    start_cursor: &mut SeekCursor,
+    end_cursor: &mut SeekCursor,
+    counts: &mut FxHashMap<(u32, u32), u16>,
+) {
+    // Regions containing the start insertion. Those that also contain the end
+    // insertion are fully counted here.
+    for interval in seek_position(lapper, startpos, start_cursor) {
+        let both_ends = endpos < interval.stop;
+        let increment = if both_ends && !pic { 2 } else { 1 };
+        add_count(counts, interval.val as u32, cell_index, increment);
+    }
+
+    // Regions containing the end insertion. A region containing the end also
+    // contains the start exactly when it begins at or before the start, and those
+    // were counted above. This is decided per region: another region holding both
+    // insertions must not stop a region that holds only the end from being counted.
+    for interval in seek_position(lapper, endpos, end_cursor) {
+        if interval.start <= startpos {
+            continue;
+        }
+        add_count(counts, interval.val as u32, cell_index, 1);
+    }
 }
 
 fn write_cells(outfile: &Path, cells: &Path, num_threads: usize) -> io::Result<()> {

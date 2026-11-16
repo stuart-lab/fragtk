@@ -1,3 +1,12 @@
+# 1.7.1
+
+### `fragtk matrix`
+
+- Fixed undercounting with overlapping regions. When one region contained both insertions of a
+  fragment, the end insertion was not counted in any other region that contained only the end
+  insertion (for example a smaller region nested inside a larger one, or two overlapping gene
+  bodies). Counts for non-overlapping regions, such as merged peaks or genome bins, are unchanged.
+
 # 1.7.0
 
 ### `fragtk matrix`
